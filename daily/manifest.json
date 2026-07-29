@@ -4,6 +4,16 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": null,
-  "lessons": []
+  "updatedAt": "2026-07-29T09:51:24+09:00",
+  "lessons": [
+    {
+      "day": 1,
+      "week": 1,
+      "title": "file, byte, encoding, serialization의 차이",
+      "summary": "논리적 값이 schema·encoding·serialization을 거쳐 byte와 파일이 되는 전체 경로와 장애 경계를 학습합니다.",
+      "path": "day-01.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-29T09:51:24+09:00"
+    }
+  ]
 }
