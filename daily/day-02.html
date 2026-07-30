@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 02</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#18251f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#fff;border:1px solid #d9e6df;border-radius:14px;overflow:hidden;table-layout:fixed;">
+<tr><td style="background:#173c32;padding:30px 26px;color:#fff;"><div style="font-size:13px;letter-spacing:1.5px;color:#93e8c9;font-weight:700;">FILE FORMAT · WEEK 1 / DAY 02</div><h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#fff;">UTF-8, newline, BOM, endian 기초</h1><p style="margin:0;color:#d6eee5;">텍스트 byte 계약과 streaming decode · 예상 학습 35분 + 실습 30분</p></td></tr>
+<tr><td style="padding:26px;">
+<div style="background:#eaf8f2;border-left:5px solid #23956d;padding:16px 18px;margin-bottom:28px;"><strong style="color:#126246;">한 줄 요약</strong><br>디스크의 “텍스트”는 문자가 아니라 byte다. UTF-8은 문자를, newline은 record 경계를, endian은 multi-byte 수의 byte 순서를 정한다. BOM은 UTF-8의 byte 순서를 정하지 않으며, 이 네 계약을 경계에서 명시해야 조용한 데이터 손상을 막을 수 있다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;overflow-wrap:anywhere;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;vertical-align:top;">Code point</td><td style="padding:10px;border:1px solid #d9e6df;">Unicode가 문자에 부여한 추상 번호다. 예: A는 U+0041. 화면의 글자 하나가 code point 여러 개로 구성될 수도 있다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Code unit</td><td style="padding:10px;border:1px solid #d9e6df;">문자 encoding이 처리하는 고정 크기 단위다. UTF-8은 8bit code unit, UTF-16은 16bit code unit을 사용한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Octet / Byte</td><td style="padding:10px;border:1px solid #d9e6df;">정확히 8bit인 저장·전송 단위다. 오늘 문맥에서는 byte와 같은 뜻으로 쓴다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">UTF-8</td><td style="padding:10px;border:1px solid #d9e6df;">Unicode code point를 1~4byte로 바꾸는 가변 길이 encoding이다. ASCII 범위는 같은 1byte 값을 사용한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Newline</td><td style="padding:10px;border:1px solid #d9e6df;">줄 끝을 표현하는 byte convention. LF는 <code>0A</code>, CR은 <code>0D</code>, CRLF는 두 byte <code>0D 0A</code>다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">BOM</td><td style="padding:10px;border:1px solid #d9e6df;">Byte Order Mark. UTF-16/32에서는 byte 순서를 알리는 표식으로 쓸 수 있다. UTF-8의 <code>EF BB BF</code>는 순서가 아닌 “UTF-8 서명” 역할만 한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Endian</td><td style="padding:10px;border:1px solid #d9e6df;">2byte 이상 값을 byte로 나열하는 순서. Big-endian은 가장 큰 자리(MSB)를 먼저, little-endian은 가장 작은 자리(LSB)를 먼저 둔다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Framing</td><td style="padding:10px;border:1px solid #d9e6df;">연속 byte stream에서 record의 시작과 끝을 알아내는 규칙. newline delimiter, length prefix, page header가 예다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Streaming decoder</td><td style="padding:10px;border:1px solid #d9e6df;">chunk 단위로 byte를 받되, 끝에 덜 들어온 multi-byte 문자를 내부 상태에 보관했다가 다음 chunk와 이어 해석하는 decoder다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가: “텍스트 파일”에도 네 개의 계약이 있다</h2>
+<p>사람은 <strong>승현,42</strong>라는 한 줄을 보지만 storage와 network는 byte만 본다. Reader가 같은 결과를 복원하려면 최소한 ① 문자 encoding, ② 줄 경계, ③ 파일 앞 표식 허용 여부, ④ binary field의 endian을 producer와 합의해야 한다. 확장자 <code>.csv</code>나 MIME type은 힌트이지 검증된 계약이 아니다.</p>
+<div style="background:#fff7e8;border:1px solid #edcf91;padding:15px 17px;margin:18px 0;"><strong>핵심 구분:</strong> UTF-8은 “문자 → byte” 규칙이고 newline은 “record 경계” 규칙이다. Endian은 “multi-byte 수/code unit → byte 순서” 규칙이다. 서로 다른 계층이므로 하나를 안다고 나머지가 자동으로 결정되지 않는다.</div>
+<p><strong>비용 관점:</strong> Encoding 오판은 보통 decode 단계에서 빨리 실패하지만, newline·BOM·endian 오판은 parser가 성공한 채 첫 column 이름이 달라지거나 숫자가 엉뚱해지는 <em>silent corruption</em>을 만들 수 있다. 그래서 “오류가 없었다”보다 byte-level 불변식과 데이터 품질 지표가 중요하다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처: logical value가 다시 값이 되는 경로</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+<tr><td style="background:#173c32;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Logical values</strong><br><span style="font-size:14px;color:#d6eee5;">문자열 “승현”, 정수 0x01020304, row 경계</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ control path: charset · newline · endian 계약</td></tr>
+<tr><td style="background:#eaf8f2;text-align:center;padding:13px;border:1px solid #a6d8c4;border-radius:8px;"><strong>② Encoder + Framer</strong><br><span style="font-size:14px;">UTF-8 encode · LF/CRLF 추가 · integer pack</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ data path: byte stream</td></tr>
+<tr><td style="background:#f3fbf7;text-align:center;padding:13px;border:1px solid #bcdccc;border-radius:8px;"><strong>③ File / Object / Network</strong><br><span style="font-size:14px;">chunk 경계는 문자·line 경계와 무관</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ read chunks + 검증</td></tr>
+<tr><td style="background:#f7faf8;text-align:center;padding:13px;border:1px solid #ccd9d2;border-radius:8px;"><strong>④ Stateful Decoder + Line Framer</strong><br><span style="font-size:14px;">BOM 정책 · carry byte · newline 상태</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ parse + schema/data-quality validation</td></tr>
+<tr><td style="background:#edf9f1;text-align:center;padding:13px;border:1px solid #b9dbc5;border-radius:8px;"><strong>⑤ Consumer values</strong><br><span style="font-size:14px;">문자열 “승현”, 정수 0x01020304, 완전한 row</span></td></tr>
+</table>
+<ol style="padding-left:22px;">
+<li><strong>Writer가 의미를 소유한다.</strong> Application은 문자열·정수·record를 갖고 있지만 아직 byte layout은 없다.</li>
+<li><strong>Control path가 해석 규칙을 전달한다.</strong> API option, schema, protocol version, content-type metadata가 charset/newline/endian을 결정한다. 파일 내용인 data path와 혼동하지 않는다.</li>
+<li><strong>Encoder와 framer가 byte를 만든다.</strong> “승현”은 UTF-8에서 <code>EC 8A B9 ED 98 84</code> 여섯 byte다. 뒤에 LF를 붙이면 <code>0A</code>가 추가된다.</li>
+<li><strong>I/O는 임의 크기로 자른다.</strong> 4KB buffer, TCP segment, object range는 code point나 line 경계를 보장하지 않는다. 세 byte 문자의 두 번째 byte에서 chunk가 끝날 수 있다.</li>
+<li><strong>Reader는 상태를 이어야 한다.</strong> Decoder가 incomplete sequence를 carry하고, CR을 본 line framer는 다음 byte가 LF인지 확인한다. 마지막에는 decoder와 framer를 flush해 불완전 입력을 검출한다.</li>
+<li><strong>성공은 parse 이후에 확정한다.</strong> Decode 성공만으로 row 의미가 맞았다고 할 수 없다. column 수, header, numeric range, row count와 checksum까지 검증한 뒤 publish한다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 UTF-8: prefix bit가 길이를 말한다</h3>
+<p>ASCII 영역 U+0000~U+007F는 <code>0xxxxxxx</code> 한 byte다. 더 큰 값은 선두 byte의 bit pattern이 전체 길이를 나타내고, 이어지는 continuation byte는 <code>10xxxxxx</code> 형태다. Decoder는 byte를 모아 code point를 복원하면서 잘못된 continuation, 허용 범위 밖 값, 불필요하게 긴 표현(overlong encoding)을 거부해야 한다.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:25%;">문자</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">UTF-8 byte</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:28%;">관찰</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">A</td><td style="padding:9px;border:1px solid #d9e6df;"><code>41</code></td><td style="padding:9px;border:1px solid #d9e6df;">1byte</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">승</td><td style="padding:9px;border:1px solid #d9e6df;"><code>EC 8A B9</code></td><td style="padding:9px;border:1px solid #d9e6df;">3byte</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">현</td><td style="padding:9px;border:1px solid #d9e6df;"><code>ED 98 84</code></td><td style="padding:9px;border:1px solid #d9e6df;">3byte</td></tr>
+</table>
+<p><strong>불변식:</strong> byte offset와 character index는 같지 않다. 따라서 byte로 자른 preview, offset 기반 재시작, 병렬 split은 문자 경계를 다시 찾아야 한다. <code>errors="ignore"</code>로 깨진 byte를 버리면 offset과 checksum이 바뀌고 원인 증거가 사라진다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Chunk boundary와 decoder state</h3>
+<p><code>EC 8A | B9 ED | 98 84</code>처럼 “승현”의 byte가 나뉘어 도착할 수 있다. 각 chunk를 독립적으로 <code>decode()</code>하면 첫 chunk가 incomplete sequence라 실패한다. Streaming decoder는 <code>EC 8A</code>를 내부 carry로 보관하고 다음 <code>B9</code>를 받아 “승”을 완성한다. EOF에서는 <code>final=true</code>로 flush해 남은 carry가 있으면 truncated input으로 실패시켜야 한다.</p>
+<div style="background:#eef5ff;border:1px solid #b9cfee;padding:15px 17px;margin:18px 0;"><strong>상태 소유자:</strong> Reader가 아니라 decoder instance가 carry byte와 오류 위치를 소유한다. 병렬 worker끼리 decoder를 공유하면 상태가 섞이고, range read를 임의 offset에서 시작하면 첫 code point를 복구할 경계 탐색 규칙이 필요하다.</div>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Newline은 문자이면서 framing protocol이다</h3>
+<p>Unix 계열은 보통 LF, Windows text는 CRLF를 쓴다. Parser가 “줄”을 record로 취급한다면 newline은 data와 control delimiter의 두 역할을 가진다. CSV처럼 quote 안 newline을 허용하는 format에서는 단순 <code>split('\n')</code>이 record를 파괴한다. Line delimiter 인식은 CSV quote state와 함께 동작해야 한다.</p>
+<ul style="padding-left:22px;">
+<li><strong>CRLF는 원자적 두 byte 규칙:</strong> chunk가 CR 직후 끝날 수 있으므로 framer가 pending CR 상태를 보관해야 한다.</li>
+<li><strong>마지막 줄:</strong> EOF 앞에 LF가 없어도 하나의 line으로 인정할지 protocol이 정해야 한다. POSIX text file 관점과 실제 parser 관용성은 다를 수 있다.</li>
+<li><strong>빈 줄:</strong> <code>LF LF</code>는 empty record인지 무시할 whitespace인지 schema가 결정한다.</li>
+<li><strong>정규화:</strong> CRLF→LF 변환은 byte checksum과 signature를 바꾼다. 원본을 보존한 뒤 파생본으로 수행해야 audit/replay가 가능하다.</li>
+</ul>
+
+<h3 style="font-size:18px;color:#126246;">4.4 BOM: UTF-8에는 byte order가 없다</h3>
+<p>UTF-8 code unit은 1byte이므로 byte 내부의 순서를 바꿀 일이 없다. 따라서 UTF-8 BOM <code>EF BB BF</code>는 endian 표시가 아니라 optional signature다. 일부 도구는 이를 자동 제거하지만, 다른 parser는 첫 header를 <code>\uFEFFid</code>로 읽거나 executable script의 <code>#!</code> 앞을 가로막을 수 있다.</p>
+<p><strong>정책:</strong> “BOM이면 무조건 지운다”가 아니라 protocol별로 allowed/required/forbidden을 선언한다. 허용할 때도 offset 0의 정확한 세 byte만 처리하며, 데이터 중간의 U+FEFF는 일반 문자일 수 있으므로 제거하지 않는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Endian: 같은 네 byte, 다른 수</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">값</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Big-endian</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Little-endian</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><code>0x01020304</code></td><td style="padding:9px;border:1px solid #d9e6df;"><code>01 02 03 04</code></td><td style="padding:9px;border:1px solid #d9e6df;"><code>04 03 02 01</code></td></tr>
+</table>
+<p>Endian은 file format 또는 protocol이 정한다. CPU native endian을 그대로 쓰면 다른 architecture나 language 구현에서 호환성이 깨진다. 예를 들어 Protobuf의 <code>fixed32</code>는 specification에 little-endian으로 정의되어 있다. 반면 network byte order는 관례적으로 big-endian이다. Format field별 계약을 따르고 “network니까 항상 big-endian” 같은 추측을 금지한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 Data path, control path, 성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:25%;">구분</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">책임과 불변식</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Data path</strong></td><td style="padding:9px;border:1px solid #d9e6df;">실제 byte가 writer→storage/network→reader로 이동한다. 원본 size/checksum과 byte offset을 보존한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Control path</strong></td><td style="padding:9px;border:1px solid #d9e6df;">charset, newline, endian, schema/version을 전달한다. metadata와 실제 byte가 일치하는지 reader가 검증한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Decode 성공</strong></td><td style="padding:9px;border:1px solid #d9e6df;">모든 byte가 유효한 character가 됐다는 뜻일 뿐 record와 값은 아직 미검증이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Ingest 성공</strong></td><td style="padding:9px;border:1px solid #d9e6df;">decode·framing·schema·quality 검증 후 결과를 atomic publish하고 재시작 cursor를 commit한 시점이다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:29%;">판단</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">권장안과 이유</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>입력 경계</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Binary mode로 원본을 받고 size·checksum·앞뒤 hex를 기록한다. Text mode의 자동 newline 변환이 증거를 바꾸지 않게 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Charset</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Protocol에 UTF-8을 명시하고 strict decode한다. 외부 legacy 입력은 탐지 결과를 신뢰하지 말고 신뢰도·producer 계약·sample 검증으로 quarantine한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>BOM</strong></td><td style="padding:9px;border:1px solid #d9e6df;">입력별 allowed/forbidden 정책과 metric을 둔다. 허용 시 offset 0에서 한 번만 제거하고 원본 checksum은 별도로 보존한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Newline</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Writer는 하나로 고정한다. Reader의 관용성은 명시하고 mixed newline count를 metric으로 남긴다. CSV는 format-aware parser를 사용한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Endian</strong></td><td style="padding:9px;border:1px solid #d9e6df;">각 numeric field의 width·signedness·endian을 schema에 고정한다. Golden byte fixture로 language 간 round-trip을 CI에서 검증한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Streaming</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Stateful incremental decoder를 connection/file마다 하나씩 둔다. EOF flush, max line length, malformed byte budget을 설정한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Publish</strong></td><td style="padding:9px;border:1px solid #d9e6df;">원본→검증된 staging→atomic pointer/rename 순으로 전환한다. 실패 시 consumer가 부분 변환본을 보지 않게 한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Version·engine 차이를 다루는 법</h3>
+<p>Language runtime은 text mode, newline normalization, 기본 charset, replacement policy가 다르다. 같은 runtime도 OS에 따라 기본값이 달라질 수 있다. “우리 서버에서 됐다”가 아니라 <strong>explicit option + golden byte fixture + cross-language test</strong>로 계약을 고정한다. Standard가 허용해도 target engine이 BOM·마지막 newline·quoted multiline을 지원하는지는 실제 지원 matrix와 integration test로 확인한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">첫 header가 <code>id</code>와 매칭되지 않음, 한글 decode error, row 수 급증/감소, chunk 크기에 따라 간헐 실패, 정수 값이 비정상적으로 큼.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">원본 checksum·size, 첫 16/마지막 16byte hex, 실패 byte offset과 주변 byte, chunk size, BOM 유무, LF/CRLF/CR 개수, 마지막 newline, producer/runtime/version, numeric field raw byte와 schema.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">UTF-8 BOM이 header에 남음, 실제 charset 불일치, multi-byte 중간에서 stateless decode, CRLF를 두 line으로 계산, quoted newline을 단순 split, EOF truncation, signedness/width/endian 불일치.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">해당 object와 downstream publish를 격리하고 원본을 immutable 보존한다. 한 sample을 strict decoder와 hex로 재현하고, BOM/newline/endian 계약을 producer metadata와 대조한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">마지막 검증된 manifest/pointer로 rollback한다. 수정한 explicit option으로 원본에서 새 output을 idempotent 재생성하고 checksum·row count·range를 검증한 뒤 atomic publish한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;"><code>errors="ignore"</code>로 byte 삭제, 운영 원본 직접 수정, 모든 CR/LF 무차별 치환, 숫자가 그럴듯해 보일 때 endian 추측, 증거 없이 전체 backfill, 실패 cursor를 성공으로 commit하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 30분 실습: byte를 직접 보고 경계 실패 주입하기</h2>
+<p><strong>목표:</strong> 같은 logical text가 BOM/newline에 따라 다른 byte가 되고, multi-byte 경계에서 stateless decode가 실패하며, endian을 잘못 읽으면 값이 달라짐을 재현한다.</p>
+<p><strong>사전 조건:</strong> Python 3가 설치된 shell. 아래 명령은 <code>/tmp/file-format-day02</code>만 사용한다. 실행 전 결과를 먼저 종이에 예측한다.</p>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>mkdir -p /tmp/file-format-day02
+cd /tmp/file-format-day02
+
+python3 -c "from pathlib import Path; Path('lf.txt').write_bytes('id,name\n1,승현\n'.encode('utf-8')); Path('crlf-bom.txt').write_bytes(b'\xef\xbb\xbf' + 'id,name\r\n1,승현\r\n'.encode('utf-8'))"
+
+od -An -tx1 -c lf.txt
+od -An -tx1 -c crlf-bom.txt
+
+python3 -c "from pathlib import Path; b=Path('lf.txt').read_bytes(); print('bytes=',len(b),'LF=',b.count(b'\n'),'CR=',b.count(b'\r'))"
+python3 -c "from pathlib import Path; b=Path('crlf-bom.txt').read_bytes(); print('bytes=',len(b),'BOM=',b.startswith(b'\xef\xbb\xbf'),'LF=',b.count(b'\n'),'CR=',b.count(b'\r'))"
+</code></div>
+<p><strong>예상 관찰:</strong> 두 파일은 화면의 행이 같지만 두 번째는 앞에 <code>EF BB BF</code>가 있고 각 줄마다 <code>0D 0A</code>가 있다. “승현”은 여섯 byte다. 따라서 character 수와 file size는 같지 않다.</p>
+
+<h3 style="font-size:18px;color:#126246;">실패 주입 A: multi-byte 문자 중간 절단</h3>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 -c "b='승'.encode(); print(b.hex()); print(b[:2].decode('utf-8'))"
+
+python3 -c "import codecs; b='승현'.encode(); d=codecs.getincrementaldecoder('utf-8')('strict'); print(repr(d.decode(b[:2],False))); print(repr(d.decode(b[2:4],False))); print(repr(d.decode(b[4:],True)))"</code></div>
+<p><strong>예상:</strong> 첫 명령은 <code>UnicodeDecodeError</code>를 낸다. 두 번째는 decoder가 앞 두 byte를 보관해 최종적으로 “승”, “현”을 순서대로 복원한다. 출력이 chunk마다 꼭 한 글자일 것이라고 가정하지 말고 합친 결과와 final flush를 검증한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">실패 주입 B: endian 뒤집기</h3>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 -c "import struct; v=0x01020304; le=struct.pack('&lt;I',v); be=struct.pack('&gt;I',v); print('LE',le.hex(),'BE',be.hex()); print('wrong',struct.unpack('&gt;I',le)[0],'right',struct.unpack('&lt;I',le)[0])"</code></div>
+<p><strong>예상:</strong> LE는 <code>04030201</code>, BE는 <code>01020304</code>다. LE byte를 BE로 읽으면 16,909,060이 아니라 67,305,985가 된다. Parser는 오류 없이 잘못된 수를 반환하므로 range validation이 필요하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">자주 나는 오류와 해결</h3>
+<ul style="padding-left:22px;">
+<li><code>od</code>가 없으면 <code>xxd -g 1 파일명</code>을 사용한다.</li>
+<li>Shell에서 <code>&lt;</code>, <code>&gt;</code>는 redirection 문자다. 위 HTML의 escape가 보일 경우 실제 명령에는 각각 단일 기호를 입력한다.</li>
+<li>첫 실패 명령의 non-zero exit는 의도한 관찰이다. 이를 파일 생성 실패로 오해하지 않는다.</li>
+<li>Editor로 저장하면 BOM/newline이 자동 변환될 수 있으므로 실험 파일은 byte API로 다시 만든다.</li>
+</ul>
+<p><strong>Cleanup:</strong> 실습 결과를 확인한 후 정확한 경로만 삭제한다.</p>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>rm -rf /tmp/file-format-day02</code></div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px;">
+<li><strong>기본 charset 의존:</strong> 개발 laptop과 production container의 locale이 달라 같은 코드가 다른 byte를 만든다.</li>
+<li><strong>UTF-8 BOM을 endian 탐지로 오해:</strong> UTF-8에는 바꿀 byte 순서가 없다. BOM은 signature일 뿐이며 허용 여부는 protocol 정책이다.</li>
+<li><strong><code>splitlines()</code>의 관용성을 계약으로 착각:</strong> Library가 여러 line ending을 받아도 원본이 규격을 지켰다는 뜻은 아니다. mixed newline metric을 남긴다.</li>
+<li><strong>Text mode checksum:</strong> 읽는 과정의 newline 변환 뒤 checksum을 계산하면 원본 object checksum과 비교할 수 없다.</li>
+<li><strong>Character 단위 offset 저장:</strong> 재시작 cursor가 byte offset인지 decoded character offset인지 명시하지 않으면 seek가 multi-byte 중간에 들어간다.</li>
+<li><strong>무제한 line buffer:</strong> newline이 없는 corrupt file 하나가 memory를 고갈시킨다. max record/line size와 quarantine이 필요하다.</li>
+<li><strong>전체 파일 encoding 탐지:</strong> 통계적 탐지는 정답 보장이 아니다. 짧은 ASCII-only sample은 여러 encoding과 동시에 호환된다.</li>
+<li><strong>Endian만 확인:</strong> width와 signedness도 계약이다. 같은 byte를 32-bit signed/unsigned 또는 64-bit로 보면 값이 달라진다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. 8GB UTF-8 로그를 16개 worker로 병렬 처리할 때 split 경계를 어떻게 잡겠습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> 요구사항(한 line=record인지, quoted newline 허용 여부, 정확히 한 번 처리) → 평균/최대 line 크기와 object range read 비용 가정 → byte range를 나누되 각 worker가 시작 offset 이후 첫 유효 newline까지 버리고 끝은 다음 newline까지 확장 → UTF-8 incremental decode와 CRLF state → record ID/offset으로 dedupe → oversized line·truncated EOF quarantine → splittable container format 전환 대안과 비용까지 설명한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q2. 특정 협력사 CSV에서만 첫 column이 누락됩니다. 어떻게 진단하고 복구합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> 장애 범위와 최근 producer 변경 확인 → 원본 checksum, 첫 16byte, header의 Unicode code point, parser 옵션 수집 → UTF-8 BOM이 <code>\uFEFFid</code>로 남았다는 가설과 대안 가설 비교 → 원본 immutable 보존·해당 batch 격리 → 명시적 BOM 정책으로 idempotent 재처리 → row/header validation 후 atomic publish → producer contract와 golden fixture 추가. 운영 원본을 직접 고치는 방식은 배제한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q3. Binary header의 4byte record count가 가끔 수십억으로 보입니다. 설계를 리뷰해 보세요.</h3>
+<p><strong>좋은 답변 구조:</strong> 정상 범위·file size·field offset 가정 → raw four bytes와 schema/version 수집 → endian, signedness, width, offset misalignment, partial write 가설 → magic/version/length/checksum 검증 → explicit endian unpack과 range invariant → 이전 manifest rollback·원본 replay → schema-generated reader 또는 self-describing header 대안, 추가 metadata 비용과 backward compatibility까지 방어한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 회상·확인 문제</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;">
+<li>파일 확장자가 실제 format을 보장하지 않는 이유는?</li>
+<li>Encoding과 serialization의 책임을 한 문장씩 구분하라.</li>
+<li><code>write()</code> 성공과 durable publish가 같은 시점이 아닌 이유는?</li>
+</ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;">
+<li>UTF-8 BOM이 byte order를 정하지 않는 이유와 실무 위험 하나를 말하라.</li>
+<li>세 byte 문자가 두 chunk에 나뉠 때 decoder가 지켜야 할 상태와 EOF 불변식은?</li>
+<li><code>04 03 02 01</code>을 32-bit little-endian과 big-endian으로 읽으면 왜 값이 달라지는가?</li>
+</ol>
+<div style="background:#edf9f1;border:1px solid #b9dbc5;padding:16px 18px;margin:18px 0;">
+<strong style="color:#126246;">짧은 정답·채점 기준</strong>
+<ol style="padding-left:22px;margin-bottom:0;">
+<li><strong>어제 1:</strong> 확장자는 이름의 suffix이며 byte layout을 강제하지 않는다. 실제 parser/schema/magic/metadata 검증을 언급하면 정답.</li>
+<li><strong>어제 2:</strong> Encoding은 값·문자와 byte의 표현 규칙, serialization은 구조화된 값과 저장/전송 표현의 계약. schema/framing까지 말하면 만점.</li>
+<li><strong>어제 3:</strong> user buffer, kernel page cache, durable media/object commit은 서로 다른 상태. atomic publish 또는 fsync/manifest를 언급하면 만점.</li>
+<li><strong>오늘 1:</strong> UTF-8 code unit이 1byte라 byte order가 없고 BOM은 signature다. 첫 header/shebang 오염을 예로 들면 만점.</li>
+<li><strong>오늘 2:</strong> incomplete continuation byte를 carry하고 EOF final flush에서 잔여 byte를 오류로 처리한다. chunk별 독립 decode 금지를 말하면 만점.</li>
+<li><strong>오늘 3:</strong> byte significance mapping이 반대이므로 LE는 <code>0x01020304</code>, BE는 <code>0x04030201</code>로 해석된다. width/signedness 계약까지 언급하면 만점.</li>
+</ol>
+</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://www.rfc-editor.org/rfc/rfc3629" style="color:#126246;">RFC 3629 — UTF-8</a>: 1~4 octet encoding, well-formed sequence, UTF-8 signature를 확인한다.</li>
+<li><a href="https://unicode.org/faq/utf_bom.html" style="color:#126246;">Unicode BOM FAQ</a>: UTF-8 BOM은 byte order가 아닌 signature이며 protocol과 충돌할 수 있음을 설명한다.</li>
+<li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap03.html" style="color:#126246;">POSIX Base Definitions</a>: text file과 line의 엄밀한 정의를 확인한다.</li>
+<li><a href="https://protobuf.dev/programming-guides/encoding/" style="color:#126246;">Protocol Buffers Encoding Guide</a>: <code>fixed32</code>/<code>fixed64</code>의 little-endian wire encoding 사례를 확인한다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<p><strong>Day 03 — text/binary, self-describing/external schema</strong>: 사람이 읽을 수 있다는 성질과 machine-readable contract를 분리하고, schema를 파일 안에 넣을지 registry·application이 소유할지 판단한다. Magic byte, header, schema fingerprint, version negotiation과 “파일은 열리지만 schema가 틀린” 장애를 다룬다.</p>
+
+<div style="margin-top:32px;padding-top:18px;border-top:1px solid #d9e6df;color:#5b6c64;font-size:14px;">File Format 심화 커리큘럼 · Week 1 / Day 02 · byte를 먼저 보고 의미를 나중에 붙인다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
