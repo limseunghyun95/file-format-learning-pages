@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 03</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#18251f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#fff;border:1px solid #d9e6df;border-radius:14px;overflow:hidden;table-layout:fixed;">
+<tr><td style="background:#173c32;padding:30px 26px;color:#fff;"><div style="font-size:13px;letter-spacing:1.5px;color:#93e8c9;font-weight:700;">FILE FORMAT · WEEK 1 / DAY 03</div><h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#fff;">text/binary와 self-describing/external schema</h1><p style="margin:0;color:#d6eee5;">표현 방식과 schema 소유권 분리 · 예상 학습 40분 + 실습 30분</p></td></tr>
+<tr><td style="padding:26px;">
+<div style="background:#eaf8f2;border-left:5px solid #23956d;padding:16px 18px;margin-bottom:28px;"><strong style="color:#126246;">한 줄 요약</strong><br><strong>text/binary</strong>는 byte를 사람이 읽기 쉬운 문자로 표현했는지의 축이고, <strong>self-describing/external schema</strong>는 byte의 의미를 복원할 계약을 어디서 얻는지의 축이다. 두 축은 독립적이며, 실무에서는 schema의 소유자·식별자·호환성·복구 경로까지 하나의 protocol로 설계해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;overflow-wrap:anywhere;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;vertical-align:top;">Text format</td><td style="padding:10px;border:1px solid #d9e6df;">문자 encoding으로 표현된 byte를 text 문법으로 해석하는 format. JSON·CSV가 대표적이다. “사람이 읽기 쉽다”는 성질이지 schema가 충분하다는 뜻은 아니다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Binary format</td><td style="padding:10px;border:1px solid #d9e6df;">값을 정해진 bit/byte layout으로 직접 표현하는 format. 암호화나 압축과 동의어가 아니며, hex로 보면 언제든 byte를 관찰할 수 있다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Syntax</td><td style="padding:10px;border:1px solid #d9e6df;">중괄호·쉼표·field tag처럼 byte를 구조로 나누는 문법 규칙이다. 문법을 안다고 business 의미까지 아는 것은 아니다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Schema</td><td style="padding:10px;border:1px solid #d9e6df;">field 이름/번호, type, nullability, default, logical meaning, compatibility를 정의하는 producer-consumer 계약.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Self-describing</td><td style="padding:10px;border:1px solid #d9e6df;">해석에 필요한 schema·type·layout metadata의 전부 또는 일부를 payload/container 안에서 얻을 수 있는 성질. “파일 하나만 있으면 모든 의미를 안다”는 절대적 성질이 아니라 정도의 문제다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">External schema</td><td style="padding:10px;border:1px solid #d9e6df;">payload 밖의 <code>.proto</code>, database catalog, schema registry, application code 등에서 해석 계약을 가져오는 방식.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Writer / Reader schema</td><td style="padding:10px;border:1px solid #d9e6df;">Writer schema는 byte를 만들 때 사용한 정확한 계약, reader schema는 consumer가 원하는 현재 계약이다. 호환 규칙이 두 schema를 연결한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Schema ID / Fingerprint</td><td style="padding:10px;border:1px solid #d9e6df;">큰 schema 대신 payload가 들고 다니는 짧은 식별자 또는 canonical schema의 hash. ID만으로는 의미가 없고 registry mapping과 무결성이 필요하다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Envelope / Container</td><td style="padding:10px;border:1px solid #d9e6df;">Payload 둘레에 magic, version, schema ID, length, checksum 같은 control metadata를 붙인 포장. Container는 여러 record/block와 metadata를 함께 보관할 수 있다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가: 두 축을 섞으면 잘못된 선택을 한다</h2>
+<p>다음 네 칸은 서로 독립적이다. JSON은 text이면서 field 이름과 기본 type을 포함하지만 <code>42</code>가 나이인지 금액인지, <code>"2026-07-31"</code>이 date인지 단순 string인지는 외부 계약이 필요하다. 반대로 Parquet·Avro object container file은 binary지만 파일 metadata에서 schema를 얻을 수 있다. Raw Protobuf message는 binary이며 field 이름과 선언 type을 알아내려면 대응하는 message definition이 필요하다.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:25%;">조합</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:29%;">예시</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">해석 계약</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">Text + 부분 self</td><td style="padding:9px;border:1px solid #d9e6df;">JSON</td><td style="padding:9px;border:1px solid #d9e6df;">Field 이름·문법 type은 보이지만 domain type·필수성·호환성은 별도 schema가 필요하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">Text + external</td><td style="padding:9px;border:1px solid #d9e6df;">CSV + data contract</td><td style="padding:9px;border:1px solid #d9e6df;">Header가 있어도 type·null·timezone·delimiter/quote 규칙은 외부 계약에 의존한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">Binary + embedded</td><td style="padding:9px;border:1px solid #d9e6df;">Avro OCF, Parquet</td><td style="padding:9px;border:1px solid #d9e6df;">Container header/footer가 writer schema와 layout metadata를 제공한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">Binary + external</td><td style="padding:9px;border:1px solid #d9e6df;">Raw Protobuf</td><td style="padding:9px;border:1px solid #d9e6df;">Wire tag는 field number와 wire type만 제공하며 이름·선언 type은 <code>.proto</code>가 필요하다.</td></tr>
+</table>
+<div style="background:#fff7e8;border:1px solid #edcf91;padding:15px 17px;margin:18px 0;"><strong>면접에서 먼저 바로잡을 오해:</strong> Binary는 “사람이 못 읽는 암호화 파일”이 아니다. Text도 compression/encryption될 수 있고 binary도 공개 specification과 schema가 있으면 완전히 해석된다. 선택의 핵심은 가독성 하나가 아니라 크기·CPU·random access·schema evolution·운영 복구다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처: schema를 찾아 값을 복원하는 전체 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+<tr><td style="background:#173c32;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Producer logical value</strong><br><span style="font-size:14px;color:#d6eee5;">{id: 7, name: "승현", joined_at: date}</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ writer schema로 validate·encode</td></tr>
+<tr><td style="background:#eaf8f2;text-align:center;padding:13px;border:1px solid #a6d8c4;border-radius:8px;"><strong>② Payload bytes</strong><br><span style="font-size:14px;">text token 또는 compact binary field</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ envelope/container: magic · version · schema locator · length · checksum</td></tr>
+<tr><td style="background:#f3fbf7;text-align:center;padding:13px;border:1px solid #bcdccc;border-radius:8px;"><strong>③ File / Object / Message</strong><br><span style="font-size:14px;">data path = payload, control path = metadata·registry mapping</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ reader가 format 식별 후 writer schema 획득</td></tr>
+<tr><td style="background:#f7faf8;text-align:center;padding:13px;border:1px solid #ccd9d2;border-radius:8px;"><strong>④ Compatibility resolution</strong><br><span style="font-size:14px;">embedded schema 또는 schema ID → registry/cache → reader schema와 비교</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ decode · projection · logical type 복원 · 품질 검증</td></tr>
+<tr><td style="background:#edf9f1;text-align:center;padding:13px;border:1px solid #b9dbc5;border-radius:8px;"><strong>⑤ Consumer value + committed state</strong><br><span style="font-size:14px;">검증된 값 publish 후에만 offset/manifest commit</span></td></tr>
+</table>
+<ol style="padding-left:22px;">
+<li><strong>Producer:</strong> Writer schema로 logical value를 검증한다. Required field, enum, range, logical type을 먼저 확인하지 않으면 잘못된 값도 유효한 byte가 된다.</li>
+<li><strong>Encoder:</strong> Text는 이름과 delimiter를 반복해 가독성을 얻고, binary는 field number/order와 type-specific encoding으로 반복 overhead를 줄일 수 있다.</li>
+<li><strong>Envelope/container:</strong> Reader가 payload를 추측하지 않도록 magic·version·schema locator·length·checksum을 둔다. Avro object container file은 header에 schema, Parquet은 footer metadata에 schema와 column 위치를 둔다.</li>
+<li><strong>Schema discovery:</strong> Embedded 방식은 file read만으로 writer schema를 얻을 수 있지만 metadata가 corrupt하면 전체 read가 막힌다. External 방식은 payload가 작지만 registry availability와 ID mapping이 control-path dependency가 된다.</li>
+<li><strong>Resolution:</strong> Writer schema로 byte를 해석한 뒤 reader schema로 projection/default/promotion을 적용한다. 현재 class 하나로 과거 byte를 바로 읽는다고 가정하면 schema drift가 silent corruption이 될 수 있다.</li>
+<li><strong>Commit:</strong> Checksum, decode, schema compatibility, row/field quality 검증과 output atomic publish가 끝난 뒤 source offset이나 manifest pointer를 commit한다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Text와 binary의 실제 비용</h3>
+<p>Logical row <code>{id: 7, active: true}</code>를 JSON으로 쓰면 field 이름, quote, colon, comma와 숫자 문자가 매 record마다 반복된다. Binary schema가 field를 번호/순서로 식별하면 이 반복을 줄일 수 있다. 그 대신 hex dump만으로 field 의미를 알기 어려워 schema tooling이 필수다.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:25%;">비용 축</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Text 경향</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Binary 경향</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">I/O·network</td><td style="padding:9px;border:1px solid #d9e6df;">Field 이름과 delimiter 반복. Compression이 반복을 잘 줄일 수 있다.</td><td style="padding:9px;border:1px solid #d9e6df;">Compact encoding 가능. Container metadata overhead는 작은 file에서 상대적으로 커진다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">CPU</td><td style="padding:9px;border:1px solid #d9e6df;">UTF-8 scan, number parsing, escape 처리와 tokenization 필요.</td><td style="padding:9px;border:1px solid #d9e6df;">Varint/bit unpack, decompression, schema-driven decode 필요. 무조건 더 빠르다고 단정할 수 없다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">Cache</td><td style="padding:9px;border:1px solid #d9e6df;">큰 byte footprint로 memory bandwidth·cache miss가 늘 수 있다.</td><td style="padding:9px;border:1px solid #d9e6df;">작은 footprint는 cache에 유리하지만 pointer-heavy object materialization은 이득을 상쇄할 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;">Debug</td><td style="padding:9px;border:1px solid #d9e6df;">기본 도구로 sample 확인이 쉽다. 눈으로 봤다는 것이 schema 검증은 아니다.</td><td style="padding:9px;border:1px solid #d9e6df;">Decoder/schema/inspection tool이 필요하지만 구조 검증을 자동화하기 쉽다.</td></tr>
+</table>
+<p><strong>결론:</strong> 실제 row 폭, cardinality, compression, query projection, batch size로 benchmark한다. “Binary가 항상 작고 빠르다”는 답은 field 이름이 짧은 작은 record, already-compressed bytes, tiny files, decode CPU 병목 같은 반례를 놓친다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Self-describing은 스펙트럼이다</h3>
+<p>JSON은 token 종류와 field 이름을 포함하지만 integer 폭, decimal precision, timezone, required/default 같은 domain schema를 완전히 담지 않는다. Parquet footer는 physical/logical schema와 column chunk 위치를 담지만 business definition과 access policy는 catalog가 소유한다. 따라서 “self-describing”은 <strong>어떤 질문에 스스로 답할 수 있는가</strong>로 정의해야 한다.</p>
+<ul style="padding-left:22px;">
+<li><strong>Syntax self-description:</strong> record와 field 경계를 찾을 수 있는가?</li>
+<li><strong>Physical self-description:</strong> byte width, encoding, compression, offset을 알 수 있는가?</li>
+<li><strong>Logical self-description:</strong> date/decimal/string처럼 physical value의 논리 type을 알 수 있는가?</li>
+<li><strong>Business self-description:</strong> 통화 단위, 개인정보 등급, null 의미, owner, freshness SLA까지 알 수 있는가?</li>
+</ul>
+<p>일반 file format은 앞의 2~3단계만 제공한다. 마지막 단계는 data catalog·contract·governance가 담당한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 세 가지 schema 전달 패턴</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:24%;">패턴</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">장점</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Failure window</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Full schema embedded</strong></td><td style="padding:9px;border:1px solid #d9e6df;">오래된 file 하나만으로 writer schema 확보. Archive·batch 교환에 강함.</td><td style="padding:9px;border:1px solid #d9e6df;">Header/footer corrupt, 작은 object마다 schema 반복, 민감한 field metadata 노출.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Schema ID embedded</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Message overhead가 작고 중앙 호환성 정책 적용 가능.</td><td style="padding:9px;border:1px solid #d9e6df;">Registry 장애·ID 충돌/재사용·cache stale·cross-environment ID 불일치.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>No locator</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Byte overhead 최소, endpoint/topic별 고정 type에서 단순.</td><td style="padding:9px;border:1px solid #d9e6df;">Routing 실수 시 type을 추측해야 하고 장기 보관·다중 version replay가 어려움.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Avro, Protobuf, Parquet의 차이</h3>
+<p><strong>Avro binary datum</strong> 자체에는 field 이름/type이 들어 있지 않다. Avro object container file은 header metadata의 <code>avro.schema</code>에 writer schema를 포함하므로 file 단위로 self-describing하다. Single-object encoding은 full schema 대신 schema fingerprint를 넣으므로 해당 fingerprint를 실제 schema로 해석할 저장소가 필요하다.</p>
+<p><strong>Raw Protobuf message</strong>는 field number, wire type, payload를 가진다. Wire type은 payload 길이를 알아내거나 unknown field를 건너뛰게 하지만 field 이름과 선언 type을 완전히 알려주지 않는다. 대응하는 <code>.proto</code> 또는 descriptor가 control path에 있어야 한다. Message 경계도 wire format 자체가 알려주지 않으므로 length prefix 같은 framing이 별도 필요하다.</p>
+<p><strong>Parquet file</strong>은 끝의 file metadata에 schema와 column chunk 위치를 둔다. Reader는 먼저 footer를 읽고 필요한 column 위치를 찾아 range read한다. 따라서 마지막 bytes가 잘린 partial upload나 corrupt footer는 앞쪽 data page가 멀쩡해도 정상 scan을 막는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Schema resolution은 decode 전후를 잇는 상태 전이</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">S0 · Raw</td><td style="padding:10px;border:1px solid #d9e6df;">Byte와 envelope metadata만 존재. 아직 field 의미 없음.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">S1 · Identified</td><td style="padding:10px;border:1px solid #d9e6df;">Magic/version/length/checksum 검증 완료. Format과 payload boundary 확정.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">S2 · Schema-bound</td><td style="padding:10px;border:1px solid #d9e6df;">정확한 writer schema를 embedded metadata 또는 immutable ID/fingerprint로 획득.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">S3 · Decoded</td><td style="padding:10px;border:1px solid #d9e6df;">Writer schema로 physical value 복원. Reader schema projection/default 적용.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">S4 · Committed</td><td style="padding:10px;border:1px solid #d9e6df;">Business validation과 atomic publish 완료. 이때만 source offset/manifest를 성공 처리.</td></tr>
+</table>
+<p><strong>불변식:</strong> <code>schema_id → canonical writer schema</code> mapping은 immutable해야 하며, payload를 만든 schema와 ID가 일치해야 한다. Registry의 동일 ID를 다른 schema로 덮으면 과거 모든 byte의 의미가 소급 변경된다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:29%;">판단</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Format 선택</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Human handoff/debug, scan projection, message latency, schema evolution, engine 생태계를 분리해 평가한다. Text/binary 한 축으로 결론 내리지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Schema ownership</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Producer가 writer schema와 ID를 소유하고 platform이 immutable registry·compatibility policy를 소유하며 consumer가 reader schema와 fallback 정책을 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Envelope</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Magic, envelope version, schema locator, payload length, checksum을 둔다. 각 field width/endian과 checksum 범위를 specification에 고정한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Registry cache</strong></td><td style="padding:9px;border:1px solid #d9e6df;">ID→schema를 로컬 bounded cache에 보관하되 ID mapping은 immutable로 가정한다. Cache miss와 registry timeout을 분리 측정하고 unknown ID는 retry 가능한 quarantine으로 보낸다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Compatibility</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Producer 배포 전에 실제 reader version들로 golden bytes를 읽는 CI를 둔다. “Schema 등록 성공”과 “모든 consumer 안전”은 다른 조건이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Archive</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Payload와 writer schema/fingerprint, format version, producer build, checksum을 함께 보존한다. Registry backup만 믿지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Schema ID별 count/error/latency, unknown ID, checksum failure, footer read failure, compatibility rejection, quarantine age를 지표화한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern과 edge case</h3>
+<ul style="padding-left:22px;">
+<li><strong>File extension으로 decoder 선택:</strong> 잘못 라우팅된 byte를 다른 parser가 관용적으로 받아 silent corruption이 생긴다. Magic/version과 parser validation을 사용한다.</li>
+<li><strong>JSON이면 schema가 필요 없다고 판단:</strong> 숫자 폭, decimal, timestamp timezone, null/absent의 차이를 잃는다.</li>
+<li><strong>Registry ID를 environment 간 그대로 복사:</strong> Dev의 ID 17과 prod의 ID 17이 다른 schema일 수 있다. Canonical fingerprint와 subject/context를 함께 검증한다.</li>
+<li><strong>현재 generated class로 과거 payload를 바로 decode:</strong> Writer schema 없이 rename/default/unknown field를 잘못 처리할 수 있다.</li>
+<li><strong>Payload마다 full schema:</strong> 작은 high-QPS message에서 network·allocation 비용이 커진다. ID+cache와 archive snapshot을 조합한다.</li>
+<li><strong>Header/footer가 있으니 corruption 검증 생략:</strong> Metadata는 self-description과 무결성을 동시에 보장하지 않는다. Length/checksum/signature는 별도다.</li>
+</ul>
+
+<h3 style="font-size:18px;color:#126246;">Version·engine 차이</h3>
+<p>Specification이 정의한 feature와 engine이 구현한 feature는 같지 않을 수 있다. Parquet는 format feature별 reader 지원이 다르고, Protobuf unknown enum/field의 application 표현은 language runtime 차이가 있을 수 있다. Avro도 generic/specific reader와 library version에 따라 오류 표면이 달라진다. 따라서 production matrix에는 <strong>writer library/version × reader engine/version × 사용 feature</strong>를 기록하고 golden file로 검증한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">갑자기 unknown schema ID 증가, 특정 version만 decode 실패, JSON은 열리지만 field 의미가 뒤바뀜, Parquet footer 오류, 정상 decode 후 값 범위 급변.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">원본 checksum·size·첫/마지막 bytes, magic/envelope version/schema ID/fingerprint, producer build·배포 시각, registry lookup status/latency/cache hit, writer·reader schema canonical form, reader engine/version, 실패 offset과 sample.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">잘못된 topic/type routing, registry 장애 또는 cross-environment ID 충돌, schema ID와 payload 불일치, incompatible change, stale generated code, partial publish로 footer truncation, checksum 범위/endian 오류.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">해당 schema ID/producer version만 격리하고 원본을 immutable 보존한다. Golden payload와 canonical writer schema를 고정해 offline decode하고 registry mapping/fingerprint를 비교한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">마지막 호환 writer와 manifest/pointer로 rollback한다. Registry mapping을 덮지 말고 새 schema version/ID를 발급한다. 보존 원본을 검증된 reader로 idempotent replay하고 품질 검증 후 atomic publish한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Schema ID 재사용/덮어쓰기, type 추측 decode, unknown field 무조건 삭제, registry 장애 중 offset 성공 commit, corrupt footer 무시 후 부분 row publish, 운영 원본 직접 수정, 전체 consumer 동시 강제 업그레이드를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 30분 실습: 같은 값, 다른 schema 전달 방식</h2>
+<p><strong>목표:</strong> JSON과 compact binary를 직접 만들고, binary envelope의 schema ID·length 검증을 실패 주입으로 확인한다. 실행 전에 JSON이 더 큰지, 잘못된 schema ID와 truncated payload가 어느 단계에서 실패할지 예측한다.</p>
+<p><strong>사전 조건:</strong> Python 3가 설치된 shell. 외부 package는 필요 없다. 정확한 임시 경로 <code>/tmp/file-format-day03</code>만 사용한다.</p>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>mkdir -p /tmp/file-format-day03
+cd /tmp/file-format-day03
+
+python3 - &lt;&lt;'PY'
+import json, struct, zlib
+from pathlib import Path
+
+row = {"id": 7, "name": "승현"}
+text = json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode()
+name = row["name"].encode("utf-8")
+payload = struct.pack("&gt;IH", row["id"], len(name)) + name
+
+# FF01 | schema_id(4B, big endian) | payload_len(4B) | payload | crc32(4B)
+header = b"FF01" + struct.pack("&gt;II", 101, len(payload))
+envelope = header + payload + struct.pack("&gt;I", zlib.crc32(payload))
+Path("row.json").write_bytes(text)
+Path("row.ff").write_bytes(envelope)
+print("json_bytes", len(text), "binary_envelope_bytes", len(envelope))
+print("json", text)
+print("binary_hex", envelope.hex())
+PY
+
+od -An -tx1 -c row.json
+od -An -tx1 row.ff</code></div>
+<p><strong>예상 관찰:</strong> JSON에는 <code>id</code>, <code>name</code>, quote와 punctuation이 반복된다. Binary payload는 field 이름 없이 4byte id, 2byte name length, UTF-8 name 순서다. Envelope에는 schema ID 101과 payload length, CRC32가 추가된다. 이 작은 예에서는 envelope metadata 때문에 binary가 반드시 더 작지 않을 수 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Reader와 실패 주입</h3>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+import struct, zlib
+from pathlib import Path
+
+SCHEMAS = {101: "id:uint32-be,name:utf8-length16-be"}
+
+def read(path):
+    b = Path(path).read_bytes()
+    if len(b) &lt; 16 or b[:4] != b"FF01":
+        raise ValueError("bad magic or truncated envelope")
+    schema_id, n = struct.unpack("&gt;II", b[4:12])
+    if schema_id not in SCHEMAS:
+        raise KeyError(f"unknown schema id: {schema_id}")
+    if len(b) != 12 + n + 4:
+        raise ValueError("payload length mismatch")
+    payload, expected_crc = b[12:12+n], struct.unpack("&gt;I", b[12+n:])[0]
+    if zlib.crc32(payload) != expected_crc:
+        raise ValueError("checksum mismatch")
+    ident, name_len = struct.unpack("&gt;IH", payload[:6])
+    name = payload[6:6+name_len].decode("utf-8", "strict")
+    if 6 + name_len != len(payload):
+        raise ValueError("schema/layout mismatch")
+    return {"id": ident, "name": name}
+
+print(read("row.ff"))
+PY
+
+# 실패 A: schema ID 999로 변조
+cp row.ff unknown-schema.ff
+python3 -c "from pathlib import Path; b=bytearray(Path('unknown-schema.ff').read_bytes()); b[4:8]=(999).to_bytes(4,'big'); Path('unknown-schema.ff').write_bytes(b)"
+
+# 실패 B: footer/checksum 끝 2byte 절단
+python3 -c "from pathlib import Path; b=Path('row.ff').read_bytes(); Path('truncated.ff').write_bytes(b[:-2])"</code></div>
+<p><strong>예상:</strong> 정상 파일은 원래 row를 복원한다. <code>unknown-schema.ff</code>는 payload를 해석하기 전에 schema lookup에서 멈춰야 한다. <code>truncated.ff</code>는 length 불변식에서 멈춰야 한다. 두 실패 파일을 정상 reader 코드의 <code>read()</code>에 넣어 어떤 예외가 나는지 확인한다.</p>
+<p><strong>자주 나는 오류와 해결:</strong> HTML에서 보이는 <code>&lt;&lt;</code>, <code>&gt;</code>는 shell에 붙여넣을 때 각각 두 개의 less-than 기호와 하나의 greater-than 기호로 렌더링된다. <code>od</code>가 없으면 <code>xxd -g 1</code>을 사용한다. CRC32는 우발적 corruption 검출용이지 공격자에 대한 암호학적 무결성 보장이 아니다.</p>
+<p><strong>Cleanup:</strong> 관찰 후 정확한 실습 디렉터리만 삭제한다.</p>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>rm -rf /tmp/file-format-day03</code></div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px;">
+<li><strong>Magic만 믿기:</strong> Format 식별은 되지만 version, length, checksum, schema 호환성은 별도로 검증해야 한다.</li>
+<li><strong>Wire type을 logical type으로 보기:</strong> Protobuf length-delimited 값은 string, bytes, embedded message, packed repeated 중 무엇인지 raw byte만으로 확정할 수 없다.</li>
+<li><strong>Schema 등록과 배포 순서:</strong> 새 writer가 먼저 나가면 오래된 consumer가 처리하지 못할 수 있다. Compatibility test와 canary, consumer-first 전략을 요구사항에 맞게 설계한다.</li>
+<li><strong>Registry를 영구 archive로 보기:</strong> Retention·backup·tenant migration 실패가 과거 payload replay를 막을 수 있다. Writer schema snapshot/fingerprint를 data와 함께 보존한다.</li>
+<li><strong>Self-describing metadata 노출:</strong> Parquet footer의 column 이름·통계도 민감 정보일 수 있다. Encryption/access control 범위를 metadata까지 검토한다.</li>
+<li><strong>Small-file overhead:</strong> Embedded schema/footer, object request, task scheduling 비용이 data보다 커질 수 있다. Compaction과 적정 file size를 함께 설계한다.</li>
+<li><strong>성공 cursor 조기 commit:</strong> Schema lookup 전에 offset을 commit하면 registry 복구 뒤 replay할 원본을 놓친다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Kafka event에 JSON과 Protobuf 중 무엇을 쓰겠습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> QPS·평균/최대 message 크기·latency·consumer 언어·schema evolution·debug 요구사항을 먼저 질문 → text/binary와 schema 전달 축을 분리 → 실제 압축 포함 크기·encode/decode CPU·allocation benchmark → schema registry availability/cache/unknown ID failure → 호환성 규칙·배포 순서·DLQ/replay → JSON+schema, Protobuf+descriptor, Avro 대안을 비교하고 수치 가정이 바뀌면 결론도 바뀐다고 설명한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q2. “Parquet은 self-describing이니 catalog가 필요 없다”는 주장에 답해 보세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Self-describing 범위를 physical/logical/business로 나눔 → footer에서 schema·column offsets를 얻는 read path → partition spec, table snapshot, ownership, PII, freshness, 여러 file의 schema evolution은 file 하나가 해결하지 못함 → footer corruption/partial upload와 small-file 비용 → file metadata + table metadata/catalog의 계층적 책임을 제시한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q3. Schema Registry 장애 중에도 consumer를 계속 운영하려면?</h3>
+<p><strong>좋은 답변 구조:</strong> 허용 가능한 RTO/RPO·새 schema 유입률·cache 크기·처리 보장 질문 → immutable ID→schema local cache와 사전 warm-up → cache hit은 계속 처리, unknown ID는 원본 보존 quarantine·offset 미commit → bounded retry/backoff·circuit breaker·지표 → registry 복구 후 순서 보장 replay → schema snapshot bundle 또는 embedded fingerprint 대안과 stale cache/ID 재사용 위험까지 방어한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 회상·확인 문제</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;">
+<li>UTF-8 BOM이 byte order를 정하지 않는 이유는?</li>
+<li>Multi-byte 문자가 chunk 사이에 잘렸을 때 decoder가 보존할 상태와 EOF 동작은?</li>
+<li><code>0x01020304</code>의 big-endian과 little-endian byte 순서를 각각 쓰라.</li>
+</ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;">
+<li>Text/binary와 self-describing/external schema가 독립된 축인 이유를 예시 두 개로 설명하라.</li>
+<li>Raw Protobuf message에서 field 이름을 확정할 수 없는 이유와 필요한 control path는?</li>
+<li>External schema registry 장애에서 duplicate/loss 없이 복구하기 위한 상태 전이는?</li>
+</ol>
+<div style="background:#edf9f1;border:1px solid #b9dbc5;padding:16px 18px;margin:18px 0;">
+<strong style="color:#126246;">짧은 정답·채점 기준</strong>
+<ol style="padding-left:22px;margin-bottom:0;">
+<li><strong>어제 1:</strong> UTF-8 code unit은 1byte라 byte order가 없고 BOM은 optional signature다. Header/shebang 오염까지 말하면 만점.</li>
+<li><strong>어제 2:</strong> Incomplete byte carry를 다음 chunk와 결합하고 EOF final flush에서 잔여 sequence를 오류 처리한다.</li>
+<li><strong>어제 3:</strong> Big-endian <code>01 02 03 04</code>, little-endian <code>04 03 02 01</code>.</li>
+<li><strong>오늘 1:</strong> JSON은 text지만 domain schema는 외부에 있을 수 있고 Avro OCF/Parquet은 binary지만 schema metadata를 포함한다. 두 축의 정의까지 있으면 만점.</li>
+<li><strong>오늘 2:</strong> Wire에는 field number와 wire type만 있어 이름·선언 type은 <code>.proto</code>/descriptor가 필요하다. Framing도 별도임을 말하면 만점.</li>
+<li><strong>오늘 3:</strong> Cached known ID만 처리하고 unknown ID 원본을 quarantine하며 offset을 commit하지 않는다. Registry 복구 후 동일 writer schema로 idempotent replay·검증·commit하면 만점.</li>
+</ol>
+</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://avro.apache.org/docs/1.12.0/specification/" style="color:#126246;">Apache Avro 1.12.0 Specification</a>: Binary datum은 schema에 의존하고 object container file header는 <code>avro.schema</code>를 포함한다.</li>
+<li><a href="https://protobuf.dev/programming-guides/encoding/" style="color:#126246;">Protocol Buffers Encoding Guide</a>: Wire의 field number·wire type과 external message definition의 역할을 확인한다.</li>
+<li><a href="https://protobuf.dev/programming-guides/techniques/" style="color:#126246;">Protocol Buffers Techniques</a>: Raw message가 type description과 message boundary를 자체 포함하지 않는 점과 descriptor 기반 대안을 확인한다.</li>
+<li><a href="https://parquet.apache.org/docs/file-format/" style="color:#126246;">Apache Parquet File Format</a>: Footer metadata와 column chunk 위치를 이용하는 reader 경로를 확인한다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<p><strong>Day 04 — row/column layout을 종이에 배치</strong>: 같은 table을 row-major와 column-major byte layout으로 직접 배치하고, point lookup·full scan·projection에서 읽는 byte 수와 CPU cache locality가 어떻게 달라지는지 계산한다. Parquet row group·column chunk·page로 이어지는 기초를 만든다.</p>
+
+<div style="margin-top:32px;padding-top:18px;border-top:1px solid #d9e6df;color:#5b6c64;font-size:14px;">File Format 심화 커리큘럼 · Week 1 / Day 03 · byte의 표현과 의미의 위치를 분리한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>

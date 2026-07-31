@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-07-30T09:23:29+09:00",
+  "updatedAt": "2026-07-31T09:02:35+09:00",
   "lessons": [
     {
       "day": 1,
@@ -23,6 +23,15 @@
       "path": "day-02.html",
       "kind": "lesson",
       "publishedAt": "2026-07-30T09:23:29+09:00"
+    },
+    {
+      "day": 3,
+      "week": 1,
+      "title": "text/binary와 self-describing/external schema",
+      "summary": "Text/binary 표현과 schema 전달 방식을 분리하고, embedded metadata·external registry의 상태·호환성·복구 trade-off를 학습합니다.",
+      "path": "day-03.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-31T09:02:35+09:00"
     }
   ]
 }
