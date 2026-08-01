@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-07-31T09:02:35+09:00",
+  "updatedAt": "2026-08-01T09:21:25+09:00",
   "lessons": [
     {
       "day": 1,
@@ -32,6 +32,15 @@
       "path": "day-03.html",
       "kind": "lesson",
       "publishedAt": "2026-07-31T09:02:35+09:00"
+    },
+    {
+      "day": 4,
+      "week": 1,
+      "title": "row/column layout을 종이에 배치",
+      "summary": "Row·column byte locality와 Parquet row group·column chunk·page 계층을 연결해 I/O·cache·pruning trade-off를 학습합니다.",
+      "path": "day-04.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-01T09:21:25+09:00"
     }
   ]
 }
