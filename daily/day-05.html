@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 05</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#18251f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#fff;border:1px solid #d9e6df;border-radius:14px;overflow:hidden;table-layout:fixed;">
+<tr><td style="background:#173c32;padding:30px 26px;color:#fff;"><div style="font-size:13px;letter-spacing:1.5px;color:#93e8c9;font-weight:700;">FILE FORMAT · WEEK 1 / DAY 05</div><h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#fff;">schema를 producer-consumer 계약으로 보기</h1><p style="margin:0;color:#d6eee5;">호환성·배포 순서·복구 가능한 evolution · 예상 학습 45분 + 실습 30분</p></td></tr>
+<tr><td style="padding:26px;">
+<div style="background:#eaf8f2;border-left:5px solid #23956d;padding:16px 18px;margin-bottom:28px;"><strong style="color:#126246;">한 줄 요약</strong><br>Schema는 단순한 field 목록이 아니라 <strong>producer가 어떤 byte를 썼고 consumer가 어떤 의미로 읽을지 합의하는 버전된 계약</strong>이다. 안전한 변경은 format 규칙만 통과하는 변경이 아니라, 구버전·신버전이 공존하는 배포 구간과 rollback, archive replay, business invariant까지 견디는 변경이다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;overflow-wrap:anywhere;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;vertical-align:top;">Producer / Consumer</td><td style="padding:10px;border:1px solid #d9e6df;">Producer는 byte를 쓰는 주체, consumer는 읽는 주체다. 같은 service도 upstream에는 consumer, downstream에는 producer일 수 있다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Writer / Reader schema</td><td style="padding:10px;border:1px solid #d9e6df;">Writer schema는 실제 byte를 만들 때 사용한 계약, reader schema는 consumer가 원하는 현재 view다. Decoder는 둘의 resolution 규칙으로 값을 복원한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Backward compatibility</td><td style="padding:10px;border:1px solid #d9e6df;"><strong>새 reader가 과거 writer data를 읽을 수 있음.</strong> Archive replay와 consumer 선배포에 중요하다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Forward compatibility</td><td style="padding:10px;border:1px solid #d9e6df;"><strong>과거 reader가 새 writer data를 읽을 수 있음.</strong> Producer가 먼저 배포되거나 consumer rollback이 일어날 때 중요하다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Full / Transitive</td><td style="padding:10px;border:1px solid #d9e6df;">Full은 backward+forward. Transitive는 최신 한 버전뿐 아니라 보존된 모든 관련 과거 버전과 비교하는 정책이다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Field identity</td><td style="padding:10px;border:1px solid #d9e6df;">시간이 지나도 같은 field임을 나타내는 안정된 식별자. 이름, Protobuf tag number, schema field ID 등 format/table layer마다 방식이 다르다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Presence / Null / Default</td><td style="padding:10px;border:1px solid #d9e6df;">Field가 없다는 것, 명시적으로 null인 것, 값이 0/빈 문자열인 것, reader가 채운 default는 서로 다른 상태일 수 있다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Unknown field</td><td style="padding:10px;border:1px solid #d9e6df;">새 writer가 보냈지만 오래된 reader schema에는 없는 field. 무시, 보존, 오류 중 동작은 format·API·변환 경로에 따라 다르다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;vertical-align:top;">Data contract</td><td style="padding:10px;border:1px solid #d9e6df;">Schema에 owner, 의미, 단위, 품질/SLA, 개인정보 등급, 변경·폐기 정책까지 더한 운영 계약.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가: 두 schema가 동시에 존재한다</h2>
+<p>Event가 저장되면 writer binary와 함께 과거 writer schema의 의미도 장기간 살아남는다. 오늘 배포한 consumer class만으로 어제 byte를 읽는 것이 아니다. 안전한 decoder는 <strong>writer schema로 byte를 해석한 뒤 reader schema로 projection·default·promotion</strong>을 적용한다.</p>
+<div style="background:#fff7e8;border:1px solid #edcf91;padding:15px 17px;margin:18px 0;"><strong>방향을 말로 먼저 풀기:</strong> Backward는 “새것이 옛것을 읽는다”, forward는 “옛것이 새것을 읽는다”. 용어만 외우면 면접에서 배포 순서를 반대로 말하기 쉽다. 항상 reader version과 writer data version을 문장으로 적는다.</div>
+<p>Format-level compatibility가 곧 application compatibility는 아니다. <code>amount</code>의 type이 그대로여도 단위가 원→센트로 바뀌면 parser는 성공하고 정산은 100배 틀린다. Optional field 추가도 오래된 consumer가 null을 처리하지 못하거나, default가 business 의미를 왜곡하면 장애다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처: schema 변경의 control path와 data path</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+<tr><td style="background:#173c32;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Change proposal</strong><br><span style="font-size:14px;color:#d6eee5;">field add/rename/type/semantics · owner · migration plan</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ compatibility + business invariant + replay test</td></tr>
+<tr><td style="background:#eaf8f2;text-align:center;padding:13px;border:1px solid #a6d8c4;border-radius:8px;"><strong>② Registry / Catalog</strong><br><span style="font-size:14px;">immutable version/ID · policy · canonical schema · approval</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ consumer-ready 신호 · generated code/artifact 배포</td></tr>
+<tr><td style="background:#f3fbf7;text-align:center;padding:13px;border:1px solid #bcdccc;border-radius:8px;"><strong>③ Mixed-version window</strong><br><span style="font-size:14px;">old/new readers + old/new writers + rollback 조합</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ data path: writer schema ID + payload</td></tr>
+<tr><td style="background:#f7faf8;text-align:center;padding:13px;border:1px solid #ccd9d2;border-radius:8px;"><strong>④ Resolve &amp; validate</strong><br><span style="font-size:14px;">writer schema 획득 → reader schema resolution → business checks</span></td></tr>
+<tr><td style="text-align:center;color:#23956d;font-size:21px;">↓ canary metrics · quarantine · idempotent replay</td></tr>
+<tr><td style="background:#edf9f1;text-align:center;padding:13px;border:1px solid #b9dbc5;border-radius:8px;"><strong>⑤ Stable / Retire</strong><br><span style="font-size:14px;">old writer 종료 → retention 경과 → field/tag는 재사용 금지</span></td></tr>
+</table>
+<ol style="padding-left:22px;">
+<li><strong>Proposal owner:</strong> Producer team이 type뿐 아니라 단위·null 의미·PII·default와 consumer 목록을 제안한다.</li>
+<li><strong>Policy gate:</strong> Registry는 syntactic compatibility를 검사하고 immutable schema ID/version을 발급한다. Registry 통과가 business 안전을 증명하지는 않는다.</li>
+<li><strong>Consumer readiness:</strong> 새 field를 무시/수용할 reader와 downstream storage가 먼저 준비된다. 실제 배포 순서는 compatibility 방향과 rollback 요구에 따라 결정한다.</li>
+<li><strong>Mixed-version data path:</strong> 새 writer가 schema ID와 payload를 발행하는 동안 old/new consumer가 동시에 읽는다. 이 교차곱이 실전 compatibility test matrix다.</li>
+<li><strong>Resolution:</strong> Consumer는 payload의 writer schema를 고정해 decode하고 자신의 reader schema를 적용한다. Unknown/default/type promotion 뒤 business range·unit을 검증한다.</li>
+<li><strong>Retirement:</strong> Old writer가 사라졌다고 즉시 field identity를 재사용하지 않는다. Log·backup·DLQ·offline file·rollback binary에 과거 byte가 남는다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Compatibility는 2차원 matrix다</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">Reader \ Data</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Old writer data</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">New writer data</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Old reader</strong></td><td style="padding:9px;border:1px solid #d9e6df;">기준 동작</td><td style="padding:9px;border:1px solid #d9e6df;">Forward compatibility·consumer rollback 검증</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>New reader</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Backward compatibility·archive replay 검증</td><td style="padding:9px;border:1px solid #d9e6df;">새 동작과 business invariant</td></tr>
+</table>
+<p>Full compatibility는 네 칸이 모두 의미 있게 동작하도록 설계하는 것에 가깝다. “Parser exception이 없음”만 테스트하지 말고 decoded value, unknown field round-trip, default 적용, downstream row count·sum·null ratio를 검증한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Field add, remove, rename, type change</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:24%;">변경</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">숨은 위험과 안전한 전략</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Add</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Old reader가 unknown field를 건너뛰고 new reader가 old data의 부재를 처리해야 한다. Default/null/presence 의미와 required application validation을 분리한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Remove</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Writer는 쓰기를 중단하되 identity를 reserve/tombstone한다. Consumer 사용량과 retention을 확인하고 reader 제거는 별도 단계로 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Rename</strong></td><td style="padding:9px;border:1px solid #d9e6df;">이름 기반 format/table은 drop+add로 볼 수 있다. Alias 또는 stable field ID가 실제 engine에서 지원되는지 확인하고, dual-read/dual-write 후 전환한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Type change</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Wire-compatible promotion이어도 overflow, precision, signedness, unit이 깨질 수 있다. 새 field를 추가해 backfill·비교 후 old field를 retire하는 expand-contract가 안전하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Semantic change</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Byte/type가 같아 registry가 잡지 못한다. 새 field/version과 단위 metadata, invariant, consumer migration을 사용한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Avro writer-reader resolution</h3>
+<p>Avro binary datum은 field 이름/type을 자체 포함하지 않으므로 writer schema가 필요하다. Record를 resolve할 때 writer에만 있는 field는 reader가 관심 없으면 건너뛸 수 있고, reader에만 있는 field는 reader schema의 default가 있어야 채울 수 있다. 숫자 type은 specification이 허용하는 promotion 범위가 있지만 값 범위·precision은 application이 검증해야 한다.</p>
+<p>Rename은 reader schema alias로 연결할 수 있지만 implementation 지원과 실제 canonical schema/registry 정책을 테스트한다. Default는 “writer가 byte에 쓴 값”이 아니라 reader가 과거 data의 부재를 해석할 때 사용하는 값일 수 있다는 점이 중요하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Protobuf field number가 identity다</h3>
+<p>Binary wire key는 field number와 wire type으로 구성된다. Field 이름을 바꿔도 binary identity는 number가 유지하지만, number를 다른 의미로 재사용하면 과거 byte가 새 field로 오해될 수 있다. 삭제한 tag number와 이름은 reserve하고 재사용하지 않는다.</p>
+<p>Proto3 binary parser는 unknown fields를 보존해 다시 serialize할 수 있지만, JSON 변환이나 field-by-field copy는 unknown fields를 잃을 수 있다. 따라서 “old proxy가 parse 후 다시 썼는데 새 field가 사라짐”이라는 failure window가 생긴다. Wire-safe change도 generated API, validation, JSON gateway, enum 처리에서 application-breaking일 수 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 File schema와 table schema</h3>
+<p>Parquet file마다 embedded schema가 있어도 table은 여러 날짜·writer version의 file을 함께 읽는다. Query engine은 file schemas를 table schema로 reconcile한다. Name-based rename, decimal precision, timestamp logical type, nested field identity의 동작은 engine/table format에 따라 다를 수 있다. File 하나가 읽힌다는 사실과 전체 snapshot schema가 일관된다는 사실은 다르다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 상태 소유자와 성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">Producer</td><td style="padding:10px;border:1px solid #d9e6df;">Writer schema ID, serialization version, semantic unit, publish idempotency를 소유.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Registry / Platform</td><td style="padding:10px;border:1px solid #d9e6df;">Immutable schema mapping, compatibility policy, audit, availability와 cache contract를 소유.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Consumer</td><td style="padding:10px;border:1px solid #d9e6df;">Reader schema, unknown/default handling, business validation, offset commit을 소유.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">성공 시점</td><td style="padding:10px;border:1px solid #d9e6df;">New/old 교차 matrix, canary, replay, downstream invariant와 rollback이 검증되고 나서 writer rollout 완료로 본다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:29%;">판단</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Compatibility policy</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Retention·rollback·consumer 독립 배포 기간에서 필요한 방향을 고른다. 무조건 full-transitive는 안전하지만 evolution 속도와 운영 비용을 높인다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Identity</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Tag/field ID는 immutable, 삭제 후 reserve. 이름 기반 format의 rename은 새 field+dual migration으로 취급한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Presence</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Absent/null/default/zero를 domain model과 test fixture에 명시한다. Default를 장애 숨김용 임시값으로 넣지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Deployment</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Expand-contract: reader 확장 → writer dual/new write → 관찰/backfill → old read/write 제거. 각 단계가 독립 rollback 가능해야 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Test matrix</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Old/new reader × old/new golden bytes, JSON gateway, unknown field round-trip, archive samples, multi-engine Parquet read를 CI에 둔다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Schema ID/version별 count·decode error·unknown/default/null ratio·range violation·quarantine age·consumer lag를 관찰한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Archive</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Payload와 writer schema/fingerprint, producer build, contract version을 함께 보존하고 정기 restore drill을 한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern과 edge case</h3>
+<ul style="padding-left:22px;">
+<li><strong>Registry 통과 = 배포 승인:</strong> Unit change, PII, downstream SQL <code>SELECT *</code>, strict JSON client는 별도 검토가 필요하다.</li>
+<li><strong>모든 consumer 동시 배포 가정:</strong> Queue lag, offline job, mobile client, rollback binary 때문에 mixed-version window는 항상 생긴다.</li>
+<li><strong>Required field 즉시 추가:</strong> Old data와 old producer가 값을 만들 수 없다. Optional/default로 expand한 뒤 application required를 단계적으로 enforce한다.</li>
+<li><strong>삭제 tag 재사용:</strong> DLQ·backup·cache의 과거 payload가 새 의미로 decode될 수 있다.</li>
+<li><strong>Unknown field 보존 가정:</strong> Binary message를 JSON이나 DTO로 왕복하면 사라질 수 있다. 실제 gateway path를 test한다.</li>
+<li><strong>Latest schema로 모든 byte decode:</strong> Writer schema를 잃으면 field order/type가 맞아 보여도 과거 의미를 잘못 복원한다.</li>
+</ul>
+
+<h3 style="font-size:18px;color:#126246;">Version·engine 차이</h3>
+<p>Avro alias와 logical type, Protobuf enum/unknown field API, Parquet schema merge·new encoding 지원은 language library와 engine/version에 따라 표면 동작이 다를 수 있다. Specification이 wire-safe라고 해도 generated API와 JSON representation은 다를 수 있다. Production matrix에 library/engine version과 transport(binary/JSON)를 함께 기록한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">특정 schema ID decode error, default/null 급증, old consumer만 실패, JSON gateway 뒤 새 field 소실, 금액 100배 변화, Parquet partition별 column type 충돌, replay job만 실패.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">원본 payload/checksum, writer schema ID·canonical schema·producer build, reader schema/library version, 배포 timeline, registry audit, unknown/default/null/range 지표, 실패/정상 sample, gateway 변환 전후 bytes, consumer lag·committed offset.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Incompatible required/type/rename, tag 재사용, wrong schema subject/ID, stale generated code/cache, unit semantic change, JSON round-trip unknown loss, partial rollout/rollback, file schema merge 차이, registry mapping 충돌.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">새 writer rollout을 멈추고 해당 schema ID/producer version만 격리한다. 원본·writer schema를 immutable 보존하고 old/new 교차 matrix로 offline 재현한다. 실패 offset은 commit하지 않는다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">마지막 compatible writer로 rollback하되 registry ID를 덮지 않는다. 새 fixed schema ID를 발급하고 consumer를 선배포한 후 canary한다. 보존 원본을 idempotent replay하고 count/sum/null/range 검증 뒤 commit한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Schema ID/tag 재사용, registry mapping overwrite, latest schema로 강제 decode, bad record 조용히 drop/default, 운영 payload 직접 수정, 모든 consumer 동시 긴급 upgrade, 실패 offset 성공 commit을 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 30분 실습: compatibility matrix를 코드로 판정</h2>
+<p><strong>목표:</strong> Old/new writer row와 old/new reader schema의 2×2 matrix를 직접 실행하고, default가 있는 field 추가와 alias 없는 rename/required 추가의 차이를 관찰한다. 실행 전 각 칸의 성공/실패를 먼저 적는다.</p>
+<p><strong>사전 조건:</strong> Python 3가 설치된 shell. 외부 package는 필요 없다. 정확한 임시 경로 <code>/tmp/file-format-day05</code>만 사용한다.</p>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>mkdir -p /tmp/file-format-day05
+cd /tmp/file-format-day05
+
+python3 - &lt;&lt;'PY'
+MISSING = object()
+
+v1 = {
+  "name": "v1",
+  "fields": [
+    {"name":"id", "type":"int"},
+    {"name":"name", "type":"string"},
+  ],
+}
+v2_safe = {
+  "name": "v2_safe",
+  "fields": [
+    {"name":"id", "type":"long"},
+    {"name":"name", "type":"string"},
+    {"name":"email", "type":["null","string"], "default":None},
+  ],
+}
+
+old_data = {"id":7, "name":"승현"}
+new_data = {"id":8, "name":"민지", "email":"m@example.com"}
+
+def matches(value, typ):
+    types = typ if isinstance(typ, list) else [typ]
+    return any((t=="null" and value is None) or
+               (t in ("int","long") and isinstance(value,int) and not isinstance(value,bool)) or
+               (t=="string" and isinstance(value,str)) for t in types)
+
+def resolve(writer_data, reader_schema):
+    out = {}
+    for f in reader_schema["fields"]:
+        value = writer_data.get(f["name"], MISSING)
+        if value is MISSING:
+            if "default" not in f:
+                raise ValueError("missing without default: " + f["name"])
+            value = f["default"]
+        if not matches(value, f["type"]):
+            raise TypeError("type mismatch: " + f["name"])
+        out[f["name"]] = value
+    return out
+
+for reader in (v1, v2_safe):
+    for label, data in (("old",old_data),("new",new_data)):
+        print(reader["name"], "reads", label, "=&gt;", resolve(data,reader))
+PY</code></div>
+<p><strong>예상 관찰:</strong> New reader는 old data에 <code>email=None</code> default를 적용한다. Old reader는 new data의 email에 관심이 없어 projection에서 제외한다. 이 toy model은 Avro-style reader projection을 단순화한 것이며 실제 format 규칙은 공식 library로 다시 검증해야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">실패 주입: rename과 required field</h3>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+MISSING = object()
+old_data = {"id":7, "name":"승현"}
+bad_readers = [
+  {"name":"rename_without_alias", "fields":[
+    {"name":"id", "default":0}, {"name":"full_name"}
+  ]},
+  {"name":"new_required_country", "fields":[
+    {"name":"id", "default":0}, {"name":"name"}, {"name":"country"}
+  ]},
+]
+for schema in bad_readers:
+    try:
+        out = {}
+        for f in schema["fields"]:
+            v = old_data.get(f["name"], MISSING)
+            if v is MISSING and "default" not in f:
+                raise ValueError("missing without default: " + f["name"])
+            out[f["name"]] = f.get("default") if v is MISSING else v
+        print(schema["name"], out)
+    except Exception as e:
+        print(schema["name"], "REJECTED:", e)
+PY</code></div>
+<p><strong>예상:</strong> <code>full_name</code>과 <code>country</code>가 old data에 없고 default/alias resolution도 없어 거부된다. 실패를 <code>""</code>로 조용히 채우면 contract 위반이 품질 장애로 바뀔 뿐 해결되지 않는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">실무 확장</h3>
+<ul style="padding-left:22px;">
+<li>Matrix에 old/new generated reader와 실제 Avro/Protobuf golden bytes를 넣는다.</li>
+<li>Decoded value뿐 아니라 unknown field를 다시 serialize했을 때 보존되는지 검증한다.</li>
+<li>Amount·timestamp·enum은 range/unit/timezone/business invariant를 추가한다.</li>
+<li>Latest 한 버전이 아니라 retention 기간의 모든 writer schema sample로 transitive replay를 수행한다.</li>
+</ul>
+<p><strong>자주 나는 오류와 해결:</strong> HTML에서 <code>&lt;&lt;</code>, <code>=&gt;</code>로 보이는 문자는 렌더링 후 실제 shell 기호가 된다. 복사 환경에서 entity가 남으면 각각 두 개의 less-than과 equals+greater-than으로 바꾼다. 첫 script는 일반 호환성 library가 아니라 개념 실습이므로 production 판단에는 공식 library compatibility API와 golden byte를 사용한다.</p>
+<p><strong>Cleanup:</strong> 관찰 후 정확한 실습 디렉터리만 삭제한다.</p>
+<div style="background:#15211c;color:#e8f5ef;border-radius:8px;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>rm -rf /tmp/file-format-day05</code></div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px;">
+<li><strong>Backward 방향 반대로 말하기:</strong> 새 reader가 old data를 읽는 방향이다. Reader와 writer version을 문장으로 쓴다.</li>
+<li><strong>Default를 producer value로 착각:</strong> Reader가 absent old field를 해석하며 채우는 값일 수 있고 byte에 기록된 사실과 다르다.</li>
+<li><strong>Null=absent=zero:</strong> Patch/merge, aggregate, billing에서 의미가 다르다. Presence를 contract에 포함한다.</li>
+<li><strong>Wire-safe=application-safe:</strong> Enum, generated API, validation, JSON gateway, downstream SQL은 별도로 깨질 수 있다.</li>
+<li><strong>Rename을 cosmetic change로 보기:</strong> Name-based system에는 drop+add다. Stable ID/alias 지원과 실제 engine behavior를 확인한다.</li>
+<li><strong>Latest-only compatibility:</strong> 오래된 archive·DLQ·offline job이 retention만큼 살아 있다면 transitive replay가 필요하다.</li>
+<li><strong>Rollback을 test하지 않기:</strong> New writer data가 이미 쌓인 뒤 old consumer로 rollback되는 forward 방향이 가장 놓치기 쉽다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Kafka event의 <code>amount:int</code>를 decimal 통화 값으로 바꾸려면?</h3>
+<p><strong>좋은 답변 구조:</strong> 현재 단위·범위·retention·consumer 수·rollback SLA 질문 → in-place type/semantic change 금지 → 새 <code>amount_minor</code>와 currency/scale field 추가 → reader 선배포·dual write·old/new 교차 matrix → 두 값 일치 metric과 canary → backfill/replay·idempotency → old field read/write 중단 후 tag reserve. Decimal string/bytes 또는 well-known Money 대안과 크기·CPU trade-off까지 설명한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q2. Backward/forward/full compatibility와 배포 순서를 연결해 설명하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> 방향을 reader/data 문장으로 정의 → old/new 2×2 matrix 작성 → consumer-first와 producer-first에서 필요한 칸 → rollback이 forward compatibility를 요구하는 이유 → registry latest/transitive 정책 → parse 성공뿐 아니라 business invariant·unknown round-trip·archive replay → full의 비용과 요구사항별 선택을 방어한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q3. 특정 Parquet partition에서만 rename된 column이 null입니다. 어떻게 대응합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Table format/engine/version·name/field-ID mapping·file별 schema 수집 → rename을 drop+add로 해석한 가설, stale catalog, mixed writers 비교 → affected snapshot 격리·old pointer 유지 → minimal file read와 query plan 재현 → alias/field ID가 지원되면 mapping 수정 검증, 아니면 dual column backfill로 새 immutable files 작성 → row count/checksum/null ratio 후 atomic snapshot 교체 → 원본 직접 patch 금지.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 회상·확인 문제</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;">
+<li>Row layout과 column layout이 각각 유리한 대표 access pattern은?</li>
+<li>Parquet의 row group, column chunk, page 관계를 설명하라.</li>
+<li>Row group을 크게 만들면 compression 외에 어떤 비용이 좋아지고 나빠지는가?</li>
+</ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;">
+<li>Backward와 forward compatibility를 reader/data version 문장으로 정의하라.</li>
+<li>Field rename/type change에 expand-contract가 필요한 이유와 단계를 말하라.</li>
+<li>Protobuf field number를 삭제 후 재사용하면 안 되는 이유와 unknown field가 사라지는 경로는?</li>
+</ol>
+<div style="background:#edf9f1;border:1px solid #b9dbc5;padding:16px 18px;margin:18px 0;">
+<strong style="color:#126246;">짧은 정답·채점 기준</strong>
+<ol style="padding-left:22px;margin-bottom:0;">
+<li><strong>어제 1:</strong> Row는 한 record 전체 point read/update, column은 projection/aggregation scan. 필요한 byte의 locality를 말하면 만점.</li>
+<li><strong>어제 2:</strong> Row group은 horizontal rows, 그 안 column별 contiguous chunk, chunk 안 encoding/compression pages.</li>
+<li><strong>어제 3:</strong> Sequential I/O·compression은 개선, writer memory·pruning granularity·retry/corruption 범위는 악화 가능.</li>
+<li><strong>오늘 1:</strong> Backward=새 reader가 old data, forward=old reader가 new data를 읽음.</li>
+<li><strong>오늘 2:</strong> In-place 의미 변경 대신 새 field 추가→reader/dual write→비교/backfill→old retire/reserve. Rollback 가능성을 말하면 만점.</li>
+<li><strong>오늘 3:</strong> 과거 byte를 새 의미로 오해하므로 reserve. Binary→JSON 또는 field-by-field copy에서 unknown이 유실될 수 있다.</li>
+</ol>
+</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://avro.apache.org/docs/1.12.0/specification/" style="color:#126246;">Apache Avro 1.12.0 Specification</a>: Writer-reader schema resolution, default, alias, numeric promotion 규칙을 확인한다.</li>
+<li><a href="https://protobuf.dev/programming-guides/proto3/" style="color:#126246;">Protocol Buffers Proto3 Guide</a>: Binary wire-safe/unsafe change와 unknown field 보존 동작을 확인한다.</li>
+<li><a href="https://protobuf.dev/best-practices/dos-donts/" style="color:#126246;">Protocol Buffers Best Practices</a>: 삭제 tag reserve, type/default 변경 회피와 mixed-version 현실을 확인한다.</li>
+<li><a href="https://parquet.apache.org/docs/file-format/versions/" style="color:#126246;">Apache Parquet Format Versions</a>: Format feature의 forward compatibility와 engine 지원 차이를 확인한다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<p><strong>Day 06 — 랩: 동일 row를 여러 포맷으로 생성·hex 관찰</strong>: Week 1 통합 실습으로 같은 logical row를 CSV·JSON·Avro·Protobuf·Parquet로 만들고 size·hex·schema 위치·row/column layout을 비교한다. 잘못된 UTF-8과 truncated file을 주입해 decoder가 어느 경계에서 실패해야 하는지도 확인한다.</p>
+
+<div style="margin-top:32px;padding-top:18px;border-top:1px solid #d9e6df;color:#5b6c64;font-size:14px;">File Format 심화 커리큘럼 · Week 1 / Day 05 · Schema 변경은 배포 프로토콜이다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>

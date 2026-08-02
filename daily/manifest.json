@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-01T09:21:25+09:00",
+  "updatedAt": "2026-08-02T09:20:49+09:00",
   "lessons": [
     {
       "day": 1,
@@ -41,6 +41,15 @@
       "path": "day-04.html",
       "kind": "lesson",
       "publishedAt": "2026-08-01T09:21:25+09:00"
+    },
+    {
+      "day": 5,
+      "week": 1,
+      "title": "schema를 producer-consumer 계약으로 보기",
+      "summary": "Writer-reader schema, compatibility 방향, field identity와 expand-contract 배포·rollback·replay를 실무 계약 관점에서 학습합니다.",
+      "path": "day-05.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-02T09:20:49+09:00"
     }
   ]
 }
