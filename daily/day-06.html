@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 06</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;">
+<div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 1 / DAY 06</div>
+<h1 style="margin:8px 0 8px;font-size:27px;line-height:1.32;color:#ffffff;">랩: 동일 row를 여러 포맷으로 생성·hex 관찰</h1>
+<div style="font-size:15px;color:#d8eee5;">Logical value → byte layout → file → scan → decode 통합 실험 · 예상 학습 45분 + 실습 30분</div>
+</td></tr>
+<tr><td style="padding:24px;">
+
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>같은 row라도 포맷마다 경계·type·schema·metadata를 byte에 표현하는 방식이 다르며, 확장자가 아니라 실제 bytes와 reader contract를 함께 봐야 안전하게 저장하고 복구할 수 있다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:27%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Logical value</strong></td><td style="padding:9px;border:1px solid #d9e6df;">프로그램이 의미로 다루는 값이다. 예를 들어 <code>{id: 513, name: "가"}</code>는 아직 특정 파일의 bytes가 아니다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Physical layout</strong></td><td style="padding:9px;border:1px solid #d9e6df;">값·길이·경계·metadata가 파일의 어느 byte offset에 어떤 순서로 놓이는지 정한 배치 규칙이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Serialization</strong></td><td style="padding:9px;border:1px solid #d9e6df;">구조화된 값을 저장·전송 가능한 byte sequence로 바꾸고 되돌리는 규칙과 과정이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Parser / decoder</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Byte를 문법과 schema에 따라 읽어 token·field·typed value로 복원하는 구성요소다. Bytes가 유효해도 잘못된 contract를 쓰면 의미는 틀릴 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Hex dump</strong></td><td style="padding:9px;border:1px solid #d9e6df;">각 byte를 16진수 두 자리로 보여 주는 관찰 방법이다. <code>41</code>은 decimal 65인 한 byte일 뿐이며, 문자 A인지는 encoding contract가 결정한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Offset</strong></td><td style="padding:9px;border:1px solid #d9e6df;">파일 시작에서 몇 번째 byte인지 나타내는 위치다. Reader는 length·offset metadata로 필요한 범위를 찾는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Magic bytes</strong></td><td style="padding:9px;border:1px solid #d9e6df;">파일 종류나 구조를 식별하려고 약속한 고정 byte 패턴이다. 확장자보다 강한 힌트지만, 전체 무결성을 보장하는 checksum은 아니다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Framing</strong></td><td style="padding:9px;border:1px solid #d9e6df;">연속된 byte stream에서 record의 시작과 끝을 찾는 규칙이다. Newline, delimiter, length prefix 등이 사용된다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Endianness</strong></td><td style="padding:9px;border:1px solid #d9e6df;">여러 byte짜리 정수를 상위 byte부터 둘지(big-endian), 하위 byte부터 둘지(little-endian) 정한 순서다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Footer</strong></td><td style="padding:9px;border:1px solid #d9e6df;">파일 끝부분에 둔 schema·offset·statistics 같은 metadata다. Reader가 먼저 끝을 읽어 data 위치를 계획할 수 있다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>운영 장애에서 “파일이 존재한다”와 “올바른 reader가 완전한 bytes를 읽어 같은 의미를 복원한다”는 전혀 다른 주장이다. 확장자가 <code>.parquet</code>여도 JSON bytes일 수 있고, UTF-8 CSV도 record 중간에서 잘렸거나 dialect가 다르면 row boundary가 바뀐다. 반대로 binary는 암호화된 것이 아니라 사람이 바로 읽기 어려운 byte layout일 뿐이다.</p>
+<p>Hex 관찰의 목적은 모든 포맷을 눈으로 decode하는 데 있지 않다. <strong>어떤 사실이 byte에 직접 있고, 어떤 의미가 외부 schema·reader 설정에 의존하는지</strong> 구분하는 데 있다. 이 경계를 알아야 schema drift, 잘린 파일, 잘못된 encoding, writer/reader 버전 차이를 증거로 진단할 수 있다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>면접 기준:</strong> “Parquet가 더 빠르다”에서 멈추지 말고, 동일 logical rows가 text token·record framing·column chunk·footer로 어떻게 달라지고, workload·CPU·I/O·복구 단위가 어떤 trade-off를 만드는지 설명해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px 6px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Logical rows</strong><br>typed values</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ schema + writer options (control path)</td></tr>
+<tr><td style="padding:12px 6px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Encoder</strong><br>CSV / JSON / NDJSON / Parquet</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ buffers → write syscall → bytes (data path)</td></tr>
+<tr><td style="padding:12px 6px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ File / object</strong><br>header · payload · metadata · footer</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ discover → open/range read → validate</td></tr>
+<tr><td style="padding:12px 6px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Reader / parser</strong><br>frame · parse metadata · decompress · decode</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ typed vectors / rows + reject evidence</td></tr>
+<tr><td style="padding:12px 6px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Consumer</strong><br>business invariant · query · checkpoint</td></tr>
+</table>
+
+<ol style="padding-left:22px;">
+<li><strong>입력 상태:</strong> Application은 integer·string·null 같은 logical values와 field 의미를 소유한다. 아직 CSV comma나 Parquet page는 없다.</li>
+<li><strong>쓰기 제어:</strong> Writer는 schema, field order, UTF-8, delimiter, codec, row-group size를 결정한다. 이것이 control path다. 실제 values가 bytes로 이동하는 경로가 data path다.</li>
+<li><strong>쓰기 성공 경계:</strong> Process buffer에 썼다는 사실은 durable publish가 아니다. Flush·close·checksum·atomic rename 또는 object commit이 끝나고 catalog/manifest가 완성된 객체만 가리켜야 성공이다.</li>
+<li><strong>읽기 계획:</strong> Text reader는 앞에서부터 delimiter와 newline을 찾는 경우가 많다. Columnar reader는 footer/schema/offset을 먼저 읽고 필요한 column chunk와 row group만 range-read할 수 있다.</li>
+<li><strong>decode와 검증:</strong> Parser 성공 뒤에도 amount 범위, nullability, row count, schema fingerprint 같은 business invariant를 통과해야 한다. 그 후에만 downstream checkpoint를 commit한다.</li>
+</ol>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;width:29%;font-weight:700;">Producer / writer</td><td style="padding:9px;border:1px solid #d9e6df;">Logical schema, serializer options, record count, idempotency key와 publish protocol을 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Storage / publisher</td><td style="padding:9px;border:1px solid #d9e6df;">완성 전 staging 격리, durable object, checksum/size, atomic visibility와 immutable version을 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Reader / consumer</td><td style="padding:9px;border:1px solid #d9e6df;">Expected format/schema, strict decode, quarantine, invariant 검증과 checkpoint를 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">핵심 불변식</td><td style="padding:9px;border:1px solid #d9e6df;">동일 input version은 동일 logical rows로 decode되고, 공개된 파일은 완전하며, 실패 row는 원본 bytes와 이유를 잃지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">소비 성공</td><td style="padding:9px;border:1px solid #d9e6df;">Decode + schema + row/count/range invariant + downstream write가 성공한 뒤 checkpoint가 원자적으로 확정될 때다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작: 의미가 bytes가 되는 순간</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Text format: token과 framing도 bytes다</h3>
+<p>CSV의 integer <code>513</code>은 보통 UTF-8 bytes <code>35 31 33</code>으로 기록된다. 숫자 513 자체를 binary integer로 저장한 것이 아니라 문자 <code>'5' '1' '3'</code>을 저장한 것이다. Comma <code>2c</code>, quote <code>22</code>, LF <code>0a</code>도 payload와 record boundary를 구성한다. Reader는 byte→문자 decode 뒤 dialect 문법을 적용하고, 다시 string→integer type conversion을 수행한다.</p>
+<p>JSON은 field name과 punctuation을 매 row 반복하므로 self-describing에 가까운 가시성을 얻는 대신 byte 수와 parsing branch가 늘어난다. JSON array는 전체 container의 닫는 bracket이 필요하지만 NDJSON은 newline으로 record를 frame해 incremental processing과 record 단위 quarantine이 쉽다. 단, string 내부 newline escape와 실제 record newline을 구분해야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Binary layout: width·length·order가 contract다</h3>
+<p>513을 unsigned 32-bit little-endian으로 저장하면 <code>01 02 00 00</code>, big-endian이면 <code>00 00 02 01</code>이다. 네 bytes만 보고 signedness·endianness·field meaning을 알 수 없다. Variable-length string은 보통 length prefix 또는 offset table이 필요하다. Prefix 하나가 손상되면 다음 field 경계까지 잃을 수 있으므로 parser는 최대 길이와 remaining bytes를 확인해야 한다.</p>
+<p>Schema-aware binary format은 field identity/type 규칙으로 parser의 추측을 줄인다. 하지만 schema가 payload 밖 registry에 있거나 writer schema를 잃으면, bytes가 온전해도 의미 복원이 불가능할 수 있다. Hex dump는 이 외부 의존성을 눈에 보이게 해 주는 증거다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Columnar file: 같은 field를 모아 locality를 바꾼다</h3>
+<p>Parquet writer는 row를 받더라도 column별 values로 재배치해 row group 안의 column chunks와 pages를 만든다. Encoding이 repetition을 줄이고 codec이 encoded bytes를 압축한다. File footer에는 schema와 row group·column chunk 위치 같은 metadata가 들어간다. Reader는 끝의 magic/footer length를 이용해 metadata를 찾고 projection·statistics에 따라 data range를 선택한다.</p>
+<p>그래서 Parquet 앞부분 128 bytes만 보고 모든 row를 읽을 수 없고, printable string이 거의 없다고 암호화된 것도 아니다. 반대로 footer magic이 보인다고 모든 page가 정상인 것도 아니다. Structural validation, checksum 지원 여부, 실제 decode와 row invariant를 단계적으로 확인해야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Memory·syscall·cache 비용</h3>
+<p>Serializer는 application objects를 buffer에 복사하고 encoding/compression을 수행한 뒤 OS write syscall로 kernel page cache에 넘긴다. Flush는 language buffer를 비울 수 있지만 storage durability까지 항상 보장하지는 않는다. 읽기에서는 file bytes가 page cache와 user-space buffer를 거쳐 parser/vector로 decode된다. Text parsing은 delimiter·escape·number conversion branch가 많고, columnar scan은 선택한 column의 연속 memory와 vectorized batch에 유리하지만 footer read·decompression·nested reconstruction 비용이 있다.</p>
+<p>작은 sample의 파일 크기는 production 압축률의 결론이 아니다. Header/footer의 고정 비용, warm page cache, row 수, cardinality, sortedness, codec, column 선택률을 통제해야 CPU/I/O trade-off를 비교할 수 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 실패 window</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:24%;">Window</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">무엇이 보이나</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">안전 장치</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Serialize 중 crash</td><td style="padding:8px;border:1px solid #d9e6df;">부분 record, 닫히지 않은 JSON, footer 없는 Parquet</td><td style="padding:8px;border:1px solid #d9e6df;">Staging path, temp file, close/validate 후 publish</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Upload 후 catalog 전</td><td style="padding:8px;border:1px solid #d9e6df;">완전하지만 orphan인 object</td><td style="padding:8px;border:1px solid #d9e6df;">Transaction ID, orphan cleanup age, retry-safe commit</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Catalog 후 object 불완전</td><td style="padding:8px;border:1px solid #d9e6df;">Reader가 partial file을 발견</td><td style="padding:8px;border:1px solid #d9e6df;">Publish 전 size/checksum/decode gate, immutable object</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Decode 후 checkpoint 전</td><td style="padding:8px;border:1px solid #d9e6df;">Retry 시 duplicate 가능</td><td style="padding:8px;border:1px solid #d9e6df;">Idempotent sink, source identity + row key, atomic checkpoint</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:29%;">판단</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">Best practice와 이유</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Format detection</strong></td><td style="padding:9px;border:1px solid #d9e6df;">확장자를 routing hint로만 쓰고 magic/header, parser probe, schema ID, content type을 함께 검증한다. 이름 변경만으로 format이 변하지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Golden bytes</strong></td><td style="padding:9px;border:1px solid #d9e6df;">대표 record의 실제 bytes·writer version·schema fingerprint·expected decoded values를 CI fixture로 보존한다. Library upgrade의 silent change를 잡는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Strict first</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Unknown encoding, extra column, malformed row를 기본 실패로 하고 명시적 quarantine 정책만 허용한다. 조용한 replace/drop은 데이터 유실을 숨긴다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Publish protocol</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Staging에 쓰고 close → size/checksum/schema/decode 검증 → immutable final publish → manifest commit 순서로 진행한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:9px;border:1px solid #d9e6df;">File별 byte size, rows, schema/version, checksum, encode/decode latency, reject reason, compression ratio와 source identity를 기록한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Benchmark</strong></td><td style="padding:9px;border:1px solid #d9e6df;">동일 logical rows와 query를 사용하고 warm/cold cache, codec, projection, selectivity, concurrency를 고정한다. 크기 하나로 결론내지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Recovery</strong></td><td style="padding:9px;border:1px solid #d9e6df;">원본 bytes를 immutable 보존하고 새 경로에 재처리한다. 운영 파일을 직접 고치지 않고 lineage와 idempotency key로 중복을 방지한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern·edge case·engine 차이</h3>
+<ul style="padding-left:22px;">
+<li><strong>Hex에 printable text가 보이면 text format:</strong> Binary file metadata나 string column도 문자 bytes를 포함할 수 있다.</li>
+<li><strong>파일 크기 = 유효 payload:</strong> Header/footer, dictionary, indexes, padding과 codec metadata가 포함된다.</li>
+<li><strong>작은 sample로 압축 승자 선정:</strong> 고정 metadata가 지배하므로 production cardinality·분포·row 수에서 다시 측정한다.</li>
+<li><strong>Parser가 열면 정상:</strong> 일부 engine은 malformed row를 null/drop하거나 type을 자동 promotion한다. Strict option과 reject count를 명시한다.</li>
+<li><strong>JSON number는 항상 정확한 integer:</strong> Reader가 IEEE 754 double로 처리하면 큰 integer precision을 잃을 수 있다. Library와 target type을 테스트한다.</li>
+<li><strong>Parquet schema 동일 = 의미 동일:</strong> Timestamp timezone, decimal scale, unit, field semantics는 physical type만으로 보장되지 않는다.</li>
+<li><strong>모든 Parquet reader가 동일:</strong> Logical type, page encoding, field ID, statistics 처리와 corrupt-file tolerance는 engine/library 버전에 따라 다를 수 있다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">확장자는 Parquet인데 reader가 magic/footer 오류, CSV row 수 급감, Unicode decode 실패, 일부 file만 schema mismatch, 재시도 뒤 중복 row, 정상 parse됐지만 amount 합계가 달라짐.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">원본 immutable copy, URI/version/ETag, byte size와 checksum, 앞·뒤 64 bytes hex, detected MIME/magic, writer build·schema·options, reader/library version, row/reject count, publish timeline, 정상 file과의 diff.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">잘못된 확장자/routing, partial upload·truncated footer, UTF-8/BOM/newline/dialect 차이, schema drift, codec/encoding 미지원, stale cache, length corruption, wrong object version, retry duplicate.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">해당 object version과 producer만 격리하고 downstream checkpoint를 멈춘다. 원본을 보존한 채 offline에서 strict reader와 hex/footer 검사를 수행하고 최근 정상 file과 비교한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Manifest를 마지막 검증된 immutable version으로 되돌린다. Correct writer로 새 object를 생성·검증해 새 version으로 publish하고 source ID 기반 idempotent replay 후 count/sum/checksum을 대조한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">확장자만 바꾸기, 운영 object 직접 byte 수정, decode error 무시/replace, bad row 조용히 drop, 모든 file 재업로드, checksum 없이 덮어쓰기, 실패 batch checkpoint commit, 원본 삭제를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 30분 통합 실습: 생성 → hex → decode → 실패 주입</h2>
+<p><strong>목표:</strong> 동일한 3개 주문 row를 CSV·JSON·NDJSON·Parquet로 생성하고, byte layout과 schema/metadata 차이를 관찰한다. 파일 크기 순위를 먼저 예측한 뒤 실행한다.</p>
+<p><strong>사전 조건:</strong> 이 저장소 루트, Docker Desktop 실행, 약 2GB 여유 공간. 처음이면 image build 시간이 추가될 수 있다. 실습은 저장소의 고정 dependency(<code>pyarrow 20.0.0</code>, <code>duckdb 1.3.2</code>)를 사용한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.1 환경과 동일 rows 생성</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>cd "/Users/limseunghyun/Documents/공부/File format"
+make doctor
+make build
+make sample
+
+wc -c practice/data/generated/orders.*</code></div>
+<p><strong>예상 관찰:</strong> 네 파일이 생성되고 Parquet schema와 DuckDB의 KR/US 집계가 출력된다. 이 3-row sample에서는 Parquet metadata 고정 비용 때문에 text보다 클 수 있다. 이것은 대규모 columnar 압축 효율을 반증하지 않는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 Hex에서 경계와 magic 찾기</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>for f in practice/data/generated/orders.csv \
+         practice/data/generated/orders.json \
+         practice/data/generated/orders.ndjson \
+         practice/data/generated/orders.parquet; do
+  echo "=== $f ==="
+  xxd -g 1 -l 128 "$f"
+done
+
+echo "=== parquet tail ==="
+tail -c 16 practice/data/generated/orders.parquet | xxd -g 1</code></div>
+<p><strong>실행 전 예측:</strong> CSV에서 comma(<code>2c</code>)와 LF(<code>0a</code>), JSON에서 brace/bracket·quote, NDJSON에서 row마다 LF를 찾는다. Parquet는 앞·뒤의 <code>PAR1</code> magic이 보이지만 row text가 연속해서 보이지 않을 것이다.</p>
+<p><strong>관찰 기록:</strong> 각 포맷에 대해 ① record 경계 ② field name 반복 여부 ③ type 정보 위치 ④ random access용 metadata ⑤ 사람이 schema 없이 복원 가능한 범위를 표로 적는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 Reader가 보는 schema와 footer</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>docker compose run --rm lab python - &lt;&lt;'PY'
+import pyarrow.parquet as pq
+
+p = "practice/data/generated/orders.parquet"
+pf = pq.ParquetFile(p)
+print("schema:", pf.schema_arrow)
+print("row_groups:", pf.metadata.num_row_groups)
+print("rows:", pf.metadata.num_rows)
+for i in range(pf.metadata.num_row_groups):
+    rg = pf.metadata.row_group(i)
+    print("row_group", i, "bytes", rg.total_byte_size)
+    for j in range(rg.num_columns):
+        c = rg.column(j)
+        print(" ", c.path_in_schema, c.compression, c.encodings)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Logical fields와 physical metadata가 분리되어 보인다. Reader는 모든 row bytes를 text처럼 scan하지 않고 footer metadata로 row group과 column 위치를 계획한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.4 실패 주입 A: 확장자와 content 불일치</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>cp practice/data/generated/orders.json \
+   practice/data/generated/json-disguised-as.parquet
+xxd -g 1 -l 16 practice/data/generated/json-disguised-as.parquet
+
+docker compose run --rm lab python - &lt;&lt;'PY'
+import pyarrow.parquet as pq
+p = "practice/data/generated/json-disguised-as.parquet"
+try:
+    pq.read_table(p)
+except Exception as e:
+    print(type(e).__name__, str(e))
+PY</code></div>
+<p><strong>예상:</strong> Hex는 JSON bracket을 보이고 Parquet reader는 magic/footer가 없어서 거부한다. 파일명을 고치는 것이 아니라 routing·producer·manifest contract를 고쳐야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.5 실패 주입 B: footer가 잘린 partial file</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>cp practice/data/generated/orders.parquet \
+   practice/data/generated/orders-truncated.parquet
+
+python3 - &lt;&lt;'PY'
+from pathlib import Path
+p = Path("practice/data/generated/orders-truncated.parquet")
+b = p.read_bytes()
+p.write_bytes(b[:-8])
+print("truncated", len(b), "-&gt;", p.stat().st_size)
+PY
+
+tail -c 16 practice/data/generated/orders-truncated.parquet | xxd -g 1
+docker compose run --rm lab python - &lt;&lt;'PY'
+import pyarrow.parquet as pq
+p = "practice/data/generated/orders-truncated.parquet"
+try:
+    pq.read_table(p)
+except Exception as e:
+    print(type(e).__name__, str(e))
+PY</code></div>
+<p><strong>예상:</strong> File은 존재하고 앞부분 data도 남아 있지만 footer length/magic을 잃어 정상 Parquet로 열리지 않는다. Reader에서 “일단 읽히는 row만” 살리기보다 원본 version을 격리하고 producer publish를 복구한다.</p>
+
+<p><strong>자주 나는 오류와 해결:</strong> Docker daemon 오류는 Docker Desktop 실행 여부를 확인한다. Image/module 오류는 <code>make build</code>를 다시 확인하되 운영 dependency를 즉석 upgrade하지 않는다. <code>xxd</code>가 없다면 <code>hexdump -C</code>를 사용한다. Permission 오류는 저장소 위치와 generated directory 소유자를 확인하고 무조건 관리자 권한으로 실행하지 않는다.</p>
+<p><strong>Cleanup:</strong> 먼저 현재 경로와 대상이 맞는지 확인한 뒤 실습 생성물과 container만 정리한다.</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>pwd
+test -d practice/data/generated &amp;&amp; rm -rf -- practice/data/generated
+make down</code></div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px;">
+<li><strong>Hex dump를 의미로 착각:</strong> 같은 bytes도 encoding/schema에 따라 다른 값이 된다. 반드시 writer contract와 함께 본다.</li>
+<li><strong>한글 한 글자 = 한 byte:</strong> UTF-8에서 한글은 여러 bytes다. Character count와 byte length를 분리한다.</li>
+<li><strong>Newline을 항상 <code>0a</code>로 가정:</strong> CRLF(<code>0d 0a</code>), quoted multiline, final newline 유무가 있다.</li>
+<li><strong>Magic bytes = 무결성:</strong> Header/footer signature가 있어도 중간 page corruption과 semantic 오류는 남을 수 있다.</li>
+<li><strong>Parquet가 3 rows에서 더 큼 = 비효율:</strong> 작은 sample에서는 footer·schema 고정 비용이 지배한다.</li>
+<li><strong>Decode 성공 후 즉시 checkpoint:</strong> Row count·range·sum·schema invariant와 sink commit까지 확인해야 안전하다.</li>
+<li><strong>복구하며 원본 덮어쓰기:</strong> 증거와 재현성을 잃는다. Immutable copy와 새 output version을 사용한다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. 동일한 주문 데이터를 CSV와 Parquet로 저장하면 bytes와 read path가 어떻게 달라집니까?</h3>
+<p><strong>좋은 답변 구조:</strong> ① workload와 row/column 수를 가정 ② CSV의 UTF-8 token·delimiter·newline·type parse ③ Parquet row group→column chunk→page·footer metadata ④ projection/pruning·decompression·vector decode 경로 ⑤ 작은 파일·point lookup·write latency 반례 ⑥ bytes read, CPU, planning time으로 검증한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q2. <code>.parquet</code> 파일이 열리지 않을 때 첫 10분의 진단 순서를 말해 보세요.</h3>
+<p><strong>좋은 답변 구조:</strong> ① 재시도/소비 checkpoint 중지 ② URI·version·size·checksum·publish timeline 수집 ③ 앞/뒤 magic과 footer, 정상 file diff ④ wrong content·partial publish·unsupported feature·schema/codec 가설 분리 ⑤ immutable 원본 격리 ⑥ last-known-good manifest rollback과 새 version 재발행 ⑦ 확장자 변경·원본 수정·silent skip 금지까지 말한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q3. Hex dump 실험을 production 포맷 선택 근거로 어떻게 확장하겠습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> ① Hex는 layout 이해와 golden-byte 회귀 검사의 도구라고 한정 ② 실제 분포·cardinality·null·nested data generator ③ codec·file/row-group size·projection·selectivity matrix ④ cold/warm cache와 concurrency 통제 ⑤ p50/p95 latency, CPU, bytes/request, rejects 측정 ⑥ corruption·schema evolution·rollback drill ⑦ 비용·호환성·운영성 ADR로 결론낸다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제: schema contract</h3>
+<ol style="padding-left:22px;">
+<li>Backward compatibility를 reader/writer 주어를 넣어 한 문장으로 정의하라.</li>
+<li>Field rename이 wire-safe처럼 보여도 위험한 이유 두 가지를 말하라.</li>
+<li>Expand-contract 배포 순서를 네 단계로 말하라.</li>
+</ol>
+<div style="padding:14px;background:#f7faf8;border:1px solid #d9e6df;"><strong>짧은 정답:</strong> ① New reader가 old writer data를 읽는다. ② 이름 기반 system에서는 drop+add가 될 수 있고, alias/field ID·JSON gateway·engine 지원이 다르다. ③ Reader 확장 → writer dual/new write → 관찰·backfill → old read/write 제거. 각 단계는 rollback 가능해야 한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;">
+<li>Hex에서 <code>35 31 33</code>과 <code>01 02 00 00</code>이 모두 513을 나타낼 수 있는 이유는?</li>
+<li>Parquet footer가 잘린 파일이 “존재하지만 publish 성공이 아닌” 이유는?</li>
+<li>확장자와 content가 다를 때 안전한 첫 조치와 하지 말아야 할 조치를 각각 말하라.</li>
+</ol>
+<div style="padding:14px;background:#eaf7f1;border:1px solid #bed9cc;"><strong>정답/채점 기준:</strong> ① 앞은 UTF-8 문자 digits, 뒤는 little-endian fixed integer라는 서로 다른 encoding contract이며 schema 없이는 의미가 확정되지 않는다. ② Reader가 schema·offset metadata와 끝 magic을 찾지 못해 완전한 decode/invariant 검증을 할 수 없다. ③ Object version을 격리하고 bytes·checksum·writer metadata를 보존해 strict offline 재현한다. 확장자만 바꾸거나 원본을 직접 고치거나 오류 row를 drop하면 안 된다. 문제당 3점: 정의 1, 내부 흐름 1, 실패/대응 1. 총 7점 이상이면 통과다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://docs.python.org/3/library/struct.html" style="color:#126246;">Python 공식 struct 문서</a> — byte order, size, alignment을 실험할 때 참고한다.</li>
+<li><a href="https://parquet.apache.org/docs/file-format/" style="color:#126246;">Apache Parquet 공식 File Format 문서</a> — row group, column chunk, page와 file layout의 기준이다.</li>
+<li><a href="https://avro.apache.org/docs/" style="color:#126246;">Apache Avro 공식 문서</a> — schema와 binary serialization, object container file을 확인한다.</li>
+<li><a href="https://protobuf.dev/programming-guides/encoding/" style="color:#126246;">Protocol Buffers 공식 Encoding 문서</a> — field number, wire type, varint와 length-delimited layout을 확인한다.</li>
+</ul>
+<p style="font-size:14px;color:#53635c;">포맷 기능과 engine 지원은 별개다. Production 적용 전 사용하는 writer/reader 버전의 implementation status와 release notes, golden bytes를 함께 검증한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Day 07 · 회상: 확장자와 실제 content가 다른 경우 설명</strong><br>이번 주의 file·byte·encoding·layout·schema를 하나의 incident response와 포맷 선택 답변으로 묶는다. 보지 않고 architecture를 그리고, evidence-first 진단과 trade-off를 면접 수준으로 방어한다.</div>
+
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>
