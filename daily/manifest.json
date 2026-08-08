@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-06T09:00:28+09:00",
+  "updatedAt": "2026-08-08T09:00:34+09:00",
   "lessons": [
     {
       "day": 1,
@@ -68,6 +68,15 @@
       "path": "day-07.html",
       "kind": "review",
       "publishedAt": "2026-08-06T09:00:28+09:00"
+    },
+    {
+      "day": 8,
+      "week": 2,
+      "title": "delimiter, quote, escape, multiline CSV",
+      "summary": "CSV를 quote-aware streaming state machine으로 이해하고 multiline 병렬 분할, strict dialect 계약, quarantine와 silent-loss 방지를 실습합니다.",
+      "path": "day-08.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-08T09:00:34+09:00"
     }
   ]
 }
