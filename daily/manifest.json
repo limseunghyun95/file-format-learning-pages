@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-08T09:00:34+09:00",
+  "updatedAt": "2026-08-09T09:21:54+09:00",
   "lessons": [
     {
       "day": 1,
@@ -77,6 +77,15 @@
       "path": "day-08.html",
       "kind": "lesson",
       "publishedAt": "2026-08-08T09:00:34+09:00"
+    },
+    {
+      "day": 9,
+      "week": 2,
+      "title": "null·empty·missing의 의미 차이",
+      "summary": "CSV·JSON의 presence semantics를 validity bitmap, SQL three-valued logic, schema evolution과 patch API까지 연결해 null·empty·missing을 끝까지 보존합니다.",
+      "path": "day-09.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-09T09:21:54+09:00"
     }
   ]
 }
