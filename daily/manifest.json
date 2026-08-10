@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-09T09:21:54+09:00",
+  "updatedAt": "2026-08-10T09:40:50+09:00",
   "lessons": [
     {
       "day": 1,
@@ -86,6 +86,15 @@
       "path": "day-09.html",
       "kind": "lesson",
       "publishedAt": "2026-08-09T09:21:54+09:00"
+    },
+    {
+      "day": 10,
+      "week": 2,
+      "title": "JSON tree, number, duplicate key",
+      "summary": "JSON bytes가 token과 tree를 거쳐 typed value가 되는 내부 흐름을 따라가며 number 정밀도, duplicate key 불일치, canonicalization과 parser resource budget을 실무 계약으로 설계합니다.",
+      "path": "day-10.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-10T09:40:50+09:00"
     }
   ]
 }
