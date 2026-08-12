@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-11T09:35:05+09:00",
+  "updatedAt": "2026-08-12T09:10:53+09:00",
   "lessons": [
     {
       "day": 1,
@@ -104,6 +104,15 @@
       "path": "day-11.html",
       "kind": "lesson",
       "publishedAt": "2026-08-11T09:35:05+09:00"
+    },
+    {
+      "day": 12,
+      "week": 2,
+      "title": "type inference와 locale/timezone 위험",
+      "summary": "Type inference를 raw lexeme의 versioned 해석 과정으로 보고 locale 숫자, ambiguous date, epoch unit, DST fold/gap과 tzdb 재현성을 strict contract로 설계합니다.",
+      "path": "day-12.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-12T09:10:53+09:00"
     }
   ]
 }

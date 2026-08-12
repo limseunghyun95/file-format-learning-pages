@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 12</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;">
+<div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 2 / DAY 12</div>
+<h1 style="margin:8px 0 8px;font-size:27px;line-height:1.32;color:#ffffff;">type inference와 locale/timezone 위험</h1>
+<div style="font-size:15px;color:#d8eee5;">Raw lexeme에서 typed column·UTC instant까지 · 예상 학습 55분 + 실습 35분</div>
+</td></tr>
+<tr><td style="padding:24px;">
+
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>Type inference는 문자열을 “알아서 이해”하는 기능이 아니라 sample·locale·timezone·range·rounding 정책으로 raw lexeme을 typed value에 투영하는 과정이다. 계약 없이 자동 추론하면 <code>00123</code>, <code>1,234</code>, <code>03/04/2026</code>, DST 경계가 서로 다른 값으로 조용히 바뀐다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:28%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Raw lexeme</strong></td><td style="padding:9px;border:1px solid #d9e6df;">입력 bytes에 쓰인 원래 token 문자열이다. <code>00123</code>은 integer 123으로 바꾸기 전의 lexeme이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Type inference</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Schema가 없거나 불완전할 때 sample values로 column type과 parsing 규칙을 추정하는 과정이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Type lattice</strong></td><td style="padding:9px;border:1px solid #d9e6df;">여러 후보 type을 더 넓은 type으로 합치는 순서다. 예: integer → decimal → string. Engine별 승격 규칙은 다를 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Locale</strong></td><td style="padding:9px;border:1px solid #d9e6df;">언어·지역별 숫자, 날짜, 통화, 정렬·표시 관습 묶음이다. Data interchange parser 계약과 사용자 표시 설정은 분리해야 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Decimal separator</strong></td><td style="padding:9px;border:1px solid #d9e6df;">정수부와 소수부를 나누는 기호다. Locale에 따라 점 또는 쉼표가 될 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Civil time</strong></td><td style="padding:9px;border:1px solid #d9e6df;">달력의 연·월·일·시·분·초처럼 사람이 지역에서 부르는 벽시계 시간이다. Zone 없이는 하나의 instant가 아닐 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Instant</strong></td><td style="padding:9px;border:1px solid #d9e6df;">전 세계 timeline 위의 한 시점이다. UTC timestamp나 epoch count로 비교할 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>UTC offset</strong></td><td style="padding:9px;border:1px solid #d9e6df;">해당 instant의 local time과 UTC 차이(예: <code>+09:00</code>)다. Offset 하나는 지역의 과거·미래 DST 규칙 전체가 아니다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Time zone ID</strong></td><td style="padding:9px;border:1px solid #d9e6df;"><code>Asia/Seoul</code>, <code>America/New_York</code>처럼 IANA rules 집합을 선택하는 이름이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>DST fold / gap</strong></td><td style="padding:9px;border:1px solid #d9e6df;">시계를 뒤로 돌려 local time이 두 번 나타나는 구간이 fold, 앞으로 건너뛰어 존재하지 않는 구간이 gap이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Epoch unit</strong></td><td style="padding:9px;border:1px solid #d9e6df;">기준 instant부터 센 단위다. Seconds·milliseconds·microseconds를 숫자 크기로 추측하면 위험하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Quarantine</strong></td><td style="padding:9px;border:1px solid #d9e6df;">계약에 맞지 않는 raw token을 이유·위치·parser version과 함께 정상 output에서 격리하는 영역이다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>우편번호 <code>00123</code>을 integer 123으로 바꾸면 leading zero는 복구할 수 없다. <code>1,234</code>는 한 locale에서는 천이백삼십사, 다른 locale에서는 1.234일 수 있다. <code>03/04/2026</code>도 3월 4일과 4월 3일이 모두 가능하다. Parser가 오류 없이 값을 만들었다고 해서 의미가 맞는 것은 아니다.</p>
+<p>시간은 더 어렵다. <code>2026-11-01 01:30 America/New_York</code>은 DST 종료 때 서로 다른 두 instants일 수 있고, <code>2026-03-08 02:30</code>은 그 zone에서 존재하지 않을 수 있다. Host local timezone을 몰래 적용하면 같은 파일이 machine·tzdb version에 따라 다른 UTC를 만든다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>핵심 원칙:</strong> Inference 결과는 data fact가 아니라 versioned decision이다. Raw lexeme과 source provenance를 보존하고, explicit schema·locale·date format·timezone·epoch unit이 있는 validated layer를 별도로 만든다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Raw bytes + provenance</strong><br>token · quoted 여부 · producer · file generation</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ decode + delimiter/quote contract</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② String tokens</strong><br><code>00123</code> · <code>1,234</code> · <code>03/04/2026</code></td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ profiler proposes candidates, never commits</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Versioned parsing contract</strong><br>type · locale · format · zone · unit · range</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ strict lexical + semantic conversion</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Typed values</strong><br>string · integer · decimal · civil time · instant UTC</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ invariant checks + reject reason</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Atomic output</strong><br>validated data + quarantine + metrics + checkpoint</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Data path:</strong> raw token → candidate → typed value → column/sink.<br><strong>Control path:</strong> schema version, null tokens, decimal/group symbols, accepted date patterns, timezone/fold/gap, epoch unit, precision/scale, overflow·rounding, tzdb version을 배포한다.</div>
+<ol style="padding-left:22px;">
+<li><strong>Capture:</strong> Bytes, quote/presence, source identifier, ingestion time를 immutable raw layer에 남긴다.</li>
+<li><strong>Profile:</strong> 전체 또는 명시된 sample에서 candidate types와 실패율·min/max·length·distinct patterns를 계산한다. 이 단계는 제안만 한다.</li>
+<li><strong>Resolve contract:</strong> Column owner가 domain을 기준으로 string/int/decimal/date/timestamp와 locale·zone·unit을 승인한다.</li>
+<li><strong>Parse strictly:</strong> Lexical pattern을 확인한 뒤 range·precision·calendar validity와 DST fold/gap을 검사한다. 임의 fallback chain은 금지한다.</li>
+<li><strong>Validate:</strong> Cross-field invariant(예: end ≥ start), null policy, accepted/rejected counts를 검증한다.</li>
+<li><strong>Commit:</strong> Typed output과 quarantine가 durable해진 뒤 checkpoint한다. Raw-to-typed mapping version이 lineage에 남아야 성공이다.</li>
+</ol>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·실패 창</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;width:30%;font-weight:700;">Producer / contract owner</td><td style="padding:9px;border:1px solid #d9e6df;">Field domain, unit, locale, date format, timezone 의미와 schema version을 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Inference profiler</td><td style="padding:9px;border:1px solid #d9e6df;">Sample selection, candidate evidence, confidence가 아니라 관찰된 pattern/실패 counts를 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Strict parser</td><td style="padding:9px;border:1px solid #d9e6df;">Contract version과 raw lexeme에서 typed value 또는 reasoned reject로 가는 deterministic mapping을 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">핵심 불변식</td><td style="padding:9px;border:1px solid #d9e6df;">동일 raw token + 동일 contract/tzdb version은 동일 typed result를 만들고, 정보 손실 변환은 승인·metric·raw lineage 없이 일어나지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">성공 시점</td><td style="padding:9px;border:1px solid #d9e6df;">Data/reject reconciliation과 domain invariants를 통과한 output·lineage·checkpoint가 함께 확정된 때다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">주요 실패 창</td><td style="padding:9px;border:1px solid #d9e6df;">Sample 뒤 unseen pattern, parser upgrade 혼재, tzdb 변경, typed output commit 뒤 lineage 전 crash, reject 누락, raw retention 만료가 있다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Inference는 hypothesis selection이다</h3>
+<p>Parser는 token마다 boolean, integer, decimal, date, timestamp, string 후보를 검사한다. 첫 1,000 rows가 모두 digits면 integer를 선택할 수 있지만 1,001번째 <code>N/A</code>, <code>12.50</code>, 20자리 ID가 나오면 reject·widen-to-string·null coercion 중 하나를 택해야 한다. 이 정책이 engine/version마다 다르면 같은 bytes가 다른 schema가 된다.</p>
+<p>Sample inference는 시간 <code>O(k×c)</code>(sample rows <code>k</code>, candidates <code>c</code>)로 싸지만 rare value를 놓친다. Full scan은 evidence가 좋지만 I/O·latency가 커지고, 여전히 domain 의미(우편번호인지 수량인지)는 알 수 없다. 따라서 inference는 schema proposal과 profiler report로 제한한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Type lattice와 irreversible widening/narrowing</h3>
+<p>Engine은 보통 candidate conflict를 더 넓은 type으로 승격한다. Integer와 decimal이 섞이면 decimal/float, 숫자와 text가 섞이면 string이 될 수 있다. 하지만 float로 승격하면 decimal 정밀도를 잃을 수 있고, string으로 늦게 승격해도 앞선 values를 이미 integer로 materialize했다면 <code>00123</code> 원형은 돌아오지 않는다.</p>
+<p>Typed column은 vectorized execution과 compression에 유리하지만 올바른 type일 때만 그렇다. Mixed-type object column은 branch와 boxing 비용을 늘리고 predicate pushdown/statistics 신뢰성을 떨어뜨린다. Raw와 validated 계층을 분리하면 정확성과 실행 효율을 동시에 얻는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Locale는 문법 계약이지 “사용자 PC 설정”이 아니다</h3>
+<p><code>1,234</code>를 comma grouping으로 볼지 decimal separator로 볼지는 source contract가 정해야 한다. Process locale·spreadsheet UI·operator laptop 설정을 암묵적으로 쓰면 재실행 결과가 달라진다. Grouping 크기, non-breaking space, currency symbol, sign 위치도 locale data에 따라 달라질 수 있다.</p>
+<p>교환 형식에서는 locale-neutral decimal dot, ISO/RFC profile date처럼 한 문법을 우선하고, 사람 표시 단계에서 locale formatting을 적용한다. Localized input이 unavoidable하면 locale tag를 record/file metadata로 전달하고 strict parser를 column별로 고정한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 날짜 문자열은 calendar fields일 뿐 instant가 아니다</h3>
+<p><code>2026-04-03</code>은 날짜이고 timezone이 필요하지 않다. <code>2026-04-03 09:00</code>은 civil datetime이며 zone 없이는 instant가 아니다. <code>2026-04-03T09:00:00+09:00</code>은 numeric offset 덕분에 instant를 정하지만, “다음 해 서울 09:00” 같은 recurring schedule의 future rules를 표현하려면 zone ID가 필요하다.</p>
+<p>Storage contract는 의미에 따라 분리한다. Event occurred_at은 UTC instant + 원 offset/zone provenance, birthday는 date, 매일 09:00 schedule은 local time + IANA zone ID + gap/fold policy가 적합하다. 모든 시간을 UTC timestamp 하나로 우겨 넣으면 civil intent가 사라진다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 DST fold와 gap resolution</h3>
+<p>Zone rules가 offset을 바꾸면 local clock이 뒤로 가는 fold에서 같은 civil time이 두 instants에 대응한다. 앞으로 가는 gap에서는 어떤 instant에도 대응하지 않는다. Library가 <code>tzinfo</code>를 붙였다고 valid가 된 것은 아니다. Candidate instants를 UTC로 보냈다가 같은 zone으로 round-trip해 원 civil fields와 일치하는지 검사한다.</p>
+<p>Fold는 earlier/later offset 또는 reject 중 business policy를 요구한다. Gap은 reject, 다음 valid instant로 shift, 이전 offset 유지 중 하나를 명시해야 한다. 예약·금융 cutoff·로그 분석마다 정책이 다르며 silent normalization은 금지한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 Offset, zone ID, tzdb version</h3>
+<p>Offset <code>-04:00</code>은 그 instant의 UTC 차이만 알려주고 <code>America/New_York</code>의 DST rules 전체를 알려주지 않는다. Time zone rules는 법·행정 결정으로 변경될 수 있으므로 IANA tz database version도 재현성의 일부다.</p>
+<p>과거 event instant가 이미 offset/UTC로 확정됐다면 tzdb update 후에도 instant는 유지해야 한다. Future civil schedule은 새 rules로 재평가할지 원래 계산을 고정할지 product policy가 필요하다. Reprocessing job은 parser·tzdb version을 lineage에 기록한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.7 Epoch 숫자는 unit 없는 물리량이다</h3>
+<p><code>1700000000</code>을 seconds로 보면 2023년대 instant지만 milliseconds로 보면 1970년 1월이다. <code>1700000000000</code>은 milliseconds로 흔해 보여도 magnitude heuristic은 과거/미래 data에서 깨진다. Schema에 unit과 origin·range를 명시하고 integer overflow와 precision을 검증한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:29%;">판단</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">Best practice와 이유</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Schema first</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Inference는 report/proposal로만 쓰고 production parsing은 versioned explicit schema로 고정한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Raw retention</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Lexeme, quote/presence, file generation, row/column 위치와 parser version을 보존해 재해석 가능하게 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Numeric contract</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Integer 범위, Decimal precision/scale, grouping 금지/허용, rounding mode, overflow policy를 column별로 정의한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Date/time contract</strong></td><td style="padding:9px;border:1px solid #d9e6df;">RFC 3339 instant, date-only, civil schedule을 다른 type으로 모델링하고 zone·fold/gap·precision을 명시한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Epoch</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Unit을 field name 추측에 맡기지 않고 schema metadata로 강제하며 min/max domain range를 검증한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Schema drift</strong></td><td style="padding:9px;border:1px solid #d9e6df;">New token pattern을 자동 widening하지 않고 quarantine·alert·contract review 후 새 output version으로 replay한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Column별 parse/reject/default/round/overflow/fold/gap count, raw pattern, min/max, timezone·tzdb version과 output reconciliation을 추적한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern·edge case·engine 차이</h3>
+<ul style="padding-left:22px;">
+<li><strong>샘플 100행=전체 schema:</strong> Rare pattern과 late drift를 놓친다.</li>
+<li><strong>Leading zero 제거:</strong> 우편번호·계정·전화번호·코드는 숫자 모양의 identifier일 수 있다.</li>
+<li><strong>여러 date pattern fallback:</strong> <code>03/04</code>처럼 둘 다 성공하면 deterministic해 보여도 의미가 틀린다.</li>
+<li><strong>Host locale/timezone 사용:</strong> Machine·container 설정에 따라 재실행 결과가 달라진다.</li>
+<li><strong>UTC로 바꾸면 끝:</strong> Recurring civil schedule과 원 zone intent를 잃을 수 있다.</li>
+<li><strong>Offset=zone:</strong> <code>+09:00</code>은 time zone rules ID가 아니다.</li>
+<li><strong>Epoch magnitude 추측:</strong> Seconds/millis/micros는 schema unit으로 정한다.</li>
+<li><strong>Engine 동일성 가정:</strong> Inference sample size, null tokens, overflow, decimal promotion, date patterns, DST normalization은 engine/version별로 다를 수 있다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Leading zero 소실, amount 1000배 차이, 특정 batch만 string type, null/reject 급증, 날짜 월·일 뒤바뀜, event가 몇 시간 이동, DST 시각 중복/누락, epoch가 1970년/먼 미래, parser upgrade 전후 aggregate 차이.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Raw bytes/lexeme·quote·row 위치, source locale/zone/unit metadata, inferred/declared schema와 sample, parser/engine/tzdb version, type/reject/default/round/overflow/fold/gap counts, min/max·length/pattern histogram, 정상 batch와 typed output.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Sample bias, auto widening/narrowing, locale/decimal separator 변경, fallback date 순서, host timezone 적용, epoch unit drift, DST fold/gap silent normalization, tzdb/engine upgrade, schema version 혼재, raw lineage 누락.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">해당 producer/schema/parser version의 publish와 checkpoint를 멈추고 raw를 보존한다. 정상/장애 golden tokens를 old/new strict parser로 비교해 최초 정보 손실 단계와 영향 partition/time range를 찾는다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good contract/parser/tzdb image로 rollback한다. 명시적 locale·zone·unit을 가진 새 output version으로 raw에서 idempotent replay하고 counts·min/max·aggregate·temporal invariants를 검증한 뒤 atomic pointer를 전환한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Typed output을 원본처럼 덮어쓰기, 실패 token을 null/0으로 일괄 치환, 여러 date pattern을 조용히 순차 적용, host timezone으로 재처리, epoch unit을 크기로 추측, DST gap을 무조건 +1시간, checkpoint 강제 전진, raw 만료 전 영향 확인 생략을 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: 정보 손실과 DST 경계 재현</h2>
+<p><strong>목표:</strong> 자동 숫자·날짜 추론이 raw 의미를 잃는 과정을 보고, explicit Decimal/date format/timezone 정책과 DST fold/gap 검증을 구현한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9+와 system IANA timezone data가 필요하다. 정확한 임시 경로 <code>/tmp/file-format-day12</code>만 사용한다.</p>
+<p><strong>실행 전 예측:</strong> <code>00123</code>, <code>1,234</code>, <code>03/04/2026</code>의 가능한 의미를 각각 적고, 뉴욕의 <code>2026-03-08 02:30</code>과 <code>2026-11-01 01:30</code>이 몇 instants에 대응할지 예측한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.1 Naive inference의 정보 손실</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>mkdir -p /tmp/file-format-day12
+cd /tmp/file-format-day12
+
+python3 - &lt;&lt;'PY'
+from datetime import datetime
+
+raw = {&quot;postal_code&quot;: &quot;00123&quot;, &quot;amount&quot;: &quot;1,234&quot;, &quot;date&quot;: &quot;03/04/2026&quot;}
+naive = {
+    &quot;postal_code&quot;: int(raw[&quot;postal_code&quot;]),
+    &quot;amount_en&quot;: int(raw[&quot;amount&quot;].replace(&quot;,&quot;, &quot;&quot;)),
+    &quot;amount_decimal_comma&quot;: raw[&quot;amount&quot;].replace(&quot;,&quot;, &quot;.&quot;),
+    &quot;date_mdy&quot;: datetime.strptime(raw[&quot;date&quot;], &quot;%m/%d/%Y&quot;).date(),
+    &quot;date_dmy&quot;: datetime.strptime(raw[&quot;date&quot;], &quot;%d/%m/%Y&quot;).date(),
+}
+print(&quot;raw=&quot;, raw)
+print(&quot;naive=&quot;, naive)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Postal code는 123이 되어 원형을 잃는다. Amount는 1234 또는 1.234가 모두 가능하고, date는 2026-03-04와 2026-04-03 모두 parse에 성공한다. Parser 성공 여부만으로 의미를 선택할 수 없다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 명시적 parsing contract</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+import re
+from datetime import datetime, timezone
+from decimal import Decimal
+
+contract = {
+    &quot;postal_code&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;pattern&quot;: r&quot;\d{5}&quot;},
+    &quot;amount&quot;: {&quot;type&quot;: &quot;decimal&quot;, &quot;decimal&quot;: &quot;,&quot;, &quot;grouping&quot;: False, &quot;scale&quot;: 3},
+    &quot;date&quot;: {&quot;type&quot;: &quot;date&quot;, &quot;format&quot;: &quot;%d/%m/%Y&quot;},
+    &quot;epoch&quot;: {&quot;type&quot;: &quot;instant&quot;, &quot;unit&quot;: &quot;milliseconds&quot;},
+}
+raw = {&quot;postal_code&quot;: &quot;00123&quot;, &quot;amount&quot;: &quot;1,234&quot;, &quot;date&quot;: &quot;03/04/2026&quot;, &quot;epoch&quot;: &quot;1700000000000&quot;}
+
+assert re.fullmatch(contract[&quot;postal_code&quot;][&quot;pattern&quot;], raw[&quot;postal_code&quot;])
+postal_code = raw[&quot;postal_code&quot;]
+amount = Decimal(raw[&quot;amount&quot;].replace(&quot;,&quot;, &quot;.&quot;))
+assert -1000000 &lt; amount &lt; 1000000
+date = datetime.strptime(raw[&quot;date&quot;], contract[&quot;date&quot;][&quot;format&quot;]).date()
+epoch_ms = int(raw[&quot;epoch&quot;])
+instant = datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc)
+print(postal_code, amount, date, instant.isoformat())
+PY</code></div>
+<p><strong>예상 관찰:</strong> <code>00123</code>은 string으로 보존되고 amount는 exact Decimal 1.234, date는 2026-04-03, epoch는 명시적 milliseconds로 UTC instant가 된다. 실제 contract에서는 precision/scale과 rounding도 검사한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 실패 주입: DST gap과 fold</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    zone = ZoneInfo(&quot;America/New_York&quot;)
+except ZoneInfoNotFoundError:
+    raise SystemExit(&quot;IANA tzdata가 필요합니다&quot;)
+
+def candidates(local_text):
+    naive = datetime.strptime(local_text, &quot;%Y-%m-%d %H:%M:%S&quot;)
+    valid = []
+    for fold in (0, 1):
+        aware = naive.replace(tzinfo=zone, fold=fold)
+        utc = aware.astimezone(timezone.utc)
+        back = utc.astimezone(zone).replace(tzinfo=None)
+        if back == naive and all(utc != old for _, old in valid):
+            valid.append((fold, utc))
+    return valid
+
+for text in (&quot;2026-03-08 02:30:00&quot;, &quot;2026-11-01 01:30:00&quot;):
+    result = candidates(text)
+    state = &quot;GAP&quot; if len(result) == 0 else &quot;UNIQUE&quot; if len(result) == 1 else &quot;FOLD&quot;
+    print(text, state, [(fold, utc.isoformat()) for fold, utc in result])
+PY</code></div>
+<p><strong>예상 관찰:</strong> 3월 시각은 유효한 candidate가 없는 GAP, 11월 시각은 서로 다른 두 UTC candidates가 있는 FOLD다. Contract가 reject/shift와 earlier/later 중 무엇을 택할지 정하지 않으면 typed instant를 만들지 않는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.4 실패 주입: sample schema drift</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+tokens = [&quot;10&quot;, &quot;20&quot;, &quot;30&quot;, &quot;12.50&quot;, &quot;N/A&quot;]
+sample = tokens[:3]
+inferred = &quot;integer&quot; if all(t.isdigit() for t in sample) else &quot;string&quot;
+print(&quot;sample=&quot;, sample, &quot;inferred=&quot;, inferred)
+for index, token in enumerate(tokens):
+    try:
+        print(index, int(token))
+    except ValueError as e:
+        print(index, &quot;QUARANTINE&quot;, repr(token), type(e).__name__)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Sample은 integer를 제안하지만 late values가 실패한다. Production에서는 auto-null/auto-widen 대신 raw token과 reason을 quarantine하고 contract review 후 새 schema version으로 replay한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.5 자주 나는 오류와 해결·cleanup</h3>
+<ul style="padding-left:22px;">
+<li><strong>ZoneInfoNotFoundError:</strong> System tzdata가 없을 수 있다. 승인된 IANA tzdata package/image를 version-pin한다.</li>
+<li><strong>Decimal을 float로 변환:</strong> 다시 binary rounding이 생긴다. DB/file까지 decimal precision/scale을 유지한다.</li>
+<li><strong><code>replace(tzinfo=zone)</code>만 사용:</strong> Gap/fold validation이 아니다. UTC round-trip candidates를 검사한다.</li>
+<li><strong>Epoch OverflowError:</strong> Unit·range·runtime 지원 범위를 먼저 검증하고 reject한다.</li>
+</ul>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>cd /tmp
+rm -rf /tmp/file-format-day12
+test ! -e /tmp/file-format-day12 &amp;&amp; echo cleaned</code></div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;">
+<li>Empty, null sentinel, malformed token을 모두 null로 합치면 producer quality와 business absence를 구분할 수 없다.</li>
+<li>Naive datetime에 UTC label만 붙이는 것은 timezone conversion이 아니라 잘못된 재해석이다.</li>
+<li>RFC 3339 offset timestamp는 instant에는 충분하지만 future civil schedule의 zone rules는 보존하지 않는다.</li>
+<li>Fractional seconds 자릿수가 다르면 string sort와 precision 비교가 예상과 다를 수 있다.</li>
+<li>Timezone abbreviation <code>CST</code>는 여러 지역을 뜻할 수 있어 zone ID로 쓰기 부적합하다.</li>
+<li>Tzdb update 후 future schedule 결과가 달라질 수 있다. 재계산 정책과 영향 audit가 필요하다.</li>
+<li>Schema inference 결과를 file metadata에 쓰고 raw를 지우면 잘못된 추론을 되돌릴 수 없다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. 20개 국가에서 오는 schema 없는 CSV의 numeric/date inference를 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Source별 locale·domain·SLO와 error budget을 묻는다 → raw immutable layer와 profiler proposal을 분리한다 → candidate/type lattice·sample bias를 설명한다 → explicit per-source contract·quarantine·reconciliation을 둔다 → schema evolution, parser version, rollback/replay까지 방어한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. 글로벌 예약 시스템의 timestamp data contract를 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Event instant와 future civil schedule을 분리한다 → instant는 RFC 3339/UTC와 precision, schedule은 local datetime+IANA zone+fold/gap policy로 모델링한다 → tzdb version·offset provenance를 저장한다 → DST candidates와 변경된 법규 처리, audit·recompute trade-off를 설명한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Parser upgrade 뒤 매출이 1,000배 증가했다면 어떻게 대응합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Publish/checkpoint를 멈춘다 → raw amount tokens, locale/decimal/grouping, old/new parser/config, version별 aggregates를 수집한다 → <code>1,234</code> 해석 drift 가설을 검증한다 → last-known-good rollback과 새 output version replay를 한다 → typed overwrite/임의 보정 금지와 예방 metrics를 제시한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습 문제와 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;">
+<li>NDJSON의 raw LF가 안전한 record boundary가 되는 문법적 이유는?</li>
+<li>Sink commit과 checkpoint 중 무엇이 먼저이며, 반대 순서의 결과는?</li>
+<li>NDJSON byte-range worker가 split 시작과 끝에서 record ownership을 정하는 방법은?</li>
+</ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;">
+<li>Full scan inference도 <code>00123</code>을 우편번호인지 수량인지 확정할 수 없는 이유는?</li>
+<li>UTC offset과 IANA time zone ID는 어떤 정보를 각각 소유하는가?</li>
+<li>DST gap/fold를 library의 단순 <code>tzinfo</code> 부착보다 안전하게 판별하는 방법은?</li>
+</ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">JSON string의 newline은 escaped돼야 하므로 unescaped <code>0x0A</code>를 delimiter로 scan할 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Sink/reject commit이 먼저다. Checkpoint 선행 뒤 crash하면 해당 record가 영구 유실된다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">시작이 0이 아니면 다음 LF 뒤부터, 종료 offset을 지난 첫 LF까지 한 worker가 담당하는 규칙을 둔다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Lexical pattern은 같아도 domain semantics가 다르다. Producer/field contract 없이는 leading zero 보존 여부를 결정할 수 없다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Offset은 특정 instant의 UTC 차이, zone ID는 지역의 시간 변화 rules 집합을 가리킨다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Fold 0/1 candidates를 UTC로 변환 후 zone으로 round-trip한다. 0개면 gap, 서로 다른 2개면 fold다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. 오늘 1번에서 information loss/raw retention, 오늘 2번에서 future rules/tzdb version, 오늘 3번에서 business resolution policy까지 말하면 면접형 답변이다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://www.rfc-editor.org/rfc/rfc3339.html" style="color:#126246;">RFC 3339 — Date and Time on the Internet</a>: Offset을 가진 unambiguous instant와 국제 교환에 부적합한 지역식 날짜의 기준을 확인한다.</li>
+<li><a href="https://data.iana.org/time-zones/theory.html" style="color:#126246;">IANA Time Zone Database theory</a>: Zone naming과 변경되는 civil time rules의 성격을 확인한다.</li>
+<li><a href="https://unicode.org/reports/tr35/tr35-numbers.html" style="color:#126246;">Unicode LDML Part 3 — Numbers</a>: Locale별 decimal/grouping symbols와 number formatting data model을 확인한다.</li>
+<li><a href="https://docs.python.org/3/library/zoneinfo.html" style="color:#126246;">Python 공식 zoneinfo 문서</a>: IANA zone support와 DST <code>fold</code> 처리 모델을 확인한다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;"><strong>Day 13 · 랩: malformed record quarantine parser</strong><br>CSV·NDJSON에 field 추가, quote/newline, invalid UTF-8, duplicate key, oversize record와 schema drift를 섞어 정상 output·reject table·checkpoint가 함께 수렴하는 parser를 구현한다.</div>
+
+</td></tr>
+<tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · raw evidence, explicit contract, deterministic replay</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>
