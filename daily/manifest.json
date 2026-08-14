@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-12T09:10:53+09:00",
+  "updatedAt": "2026-08-14T09:19:41+09:00",
   "lessons": [
     {
       "day": 1,
@@ -113,6 +113,15 @@
       "path": "day-12.html",
       "kind": "lesson",
       "publishedAt": "2026-08-12T09:10:53+09:00"
+    },
+    {
+      "day": 13,
+      "week": 2,
+      "title": "랩: malformed record quarantine parser",
+      "summary": "Invalid UTF-8, oversize, duplicate key, schema drift와 bad timestamp를 격리하며 accepted+rejected reconciliation, idempotent sink와 checkpoint 순서를 통합 실습합니다.",
+      "path": "day-13.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-14T09:19:41+09:00"
     }
   ]
 }
