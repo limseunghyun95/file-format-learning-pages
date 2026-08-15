@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 14</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 2 / DAY 14 · CLOSED-BOOK REVIEW</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">회상: CSV dialect contract 작성</h1><div style="font-size:15px;color:#d8eee5;">Week 2 parsing contract · incident review · 예상 학습 50분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>CSV는 “쉼표로 나눈 텍스트”가 아니라 encoding·delimiter·quote·escape·line terminator·header·null·schema를 함께 고정해야 같은 bytes를 같은 rows로 복원할 수 있는 상태 머신 계약이다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:27%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>CSV</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Comma-Separated Values. Record를 줄 단위로, field를 구분 문자로 표현하는 text 계열 포맷이다. 실제 현장 파일은 comma 이외 구분자도 흔해 이름만으로 문법을 확정할 수 없다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Dialect</strong></td><td style="padding:9px;border:1px solid #d9e6df;">한 CSV 변형을 해석하는 문법 옵션 묶음이다. Delimiter, quote character, quote escaping, line terminator, header 유무 등이 포함된다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Delimiter</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Quote 밖에서 field 경계를 표시하는 문자다. 쉼표·탭·세미콜론 등이 가능하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Quote character</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Delimiter나 newline을 field 값으로 포함시키기 위해 field를 감싸는 문자다. 보통 double quote지만 계약으로 고정해야 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Double quote</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Quoted field 안의 quote 하나를 quote 두 개로 표현하는 규칙이다. 예: <code>""</code>는 값 안의 <code>"</code> 하나다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Escape character</strong></td><td style="padding:9px;border:1px solid #d9e6df;">뒤 문자의 문법 의미를 제거하는 별도 문자다. Backslash escape와 double-quote 방식은 다르며 혼용하면 해석이 갈린다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Logical record</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Schema상 한 row에 해당하는 단위다. Quoted field 안 newline 때문에 여러 physical lines를 차지할 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Line terminator</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Quote 밖에서 record 끝을 표시하는 byte sequence다. CRLF(<code>\r\n</code>)와 LF(<code>\n</code>)를 구분하고 writer·reader 허용 범위를 정한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>BOM</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Byte Order Mark. UTF-8에서 선택적으로 붙는 <code>EF BB BF</code> bytes다. 제거 정책이 없으면 첫 column 이름에 보이지 않는 문자가 섞일 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Null token</strong></td><td style="padding:9px;border:1px solid #d9e6df;">값 없음(null)을 나타내기로 합의한 문자열이다. Empty string과 missing column을 같은 상태로 취급하지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Strict parser</strong></td><td style="padding:9px;border:1px solid #d9e6df;">잘못된 quote·열 수·encoding을 추측으로 복구하지 않고 명시적으로 실패시키는 reader 설정이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Contract version</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Dialect와 schema·null·timezone 규칙을 함께 식별하는 불변 버전이다. 같은 path의 의미를 조용히 바꾸지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>Bytes <code>1,2,3</code>은 comma dialect에서는 세 fields지만 semicolon dialect에서는 하나의 field다. <code>"a,b"</code>는 quote 규칙이 켜져 있으면 한 field지만 단순 <code>split(',')</code>에는 두 fields다. 같은 파일을 두 엔진이 “성공”해서 읽었는데 row·column 수가 다른 이유가 바로 숨은 dialect다.</p>
+<p>문법만 맞아도 의미는 남는다. Empty field가 null인지 empty string인지, <code>01/02/03</code>이 어느 locale의 날짜인지, header가 data인지, duplicate header를 허용하는지 결정해야 한다. 이런 결정을 inference에 맡기면 library upgrade나 sample 변화가 data type과 집계를 바꾼다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>Week 2 최종 불변식:</strong> 하나의 immutable input generation과 contract version에 대해 모든 complete logical record는 정확히 하나의 ACCEPTED 또는 REJECTED 상태를 갖고, <code>complete = accepted + rejected</code>이며 checkpoint는 terminal result가 durable해진 뒤에만 전진한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Producer</strong><br>logical values + schema + contract version</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ format values → encode characters → immutable bytes</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Staging object</strong><br>CSV bytes + size + checksum + declared dialect</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ strict validation before publish</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Streaming reader</strong><br>bounded byte decode → quote-aware state machine → logical records</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ header/schema/null/type/domain validation</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Terminal routing</strong><br>ACCEPTED typed row ↙　↘ REJECTED raw/digest + reason</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ reconciliation and reject-rate gate</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Commit</strong><br>idempotent sinks → checkpoint → catalog/manifest publish</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Data path:</strong> bytes → code points → tokens → fields → typed row → sink.<br><strong>Control path:</strong> encoding, dialect, schema, null/date/timezone, limits, error taxonomy, contract version과 rollout policy를 전달한다.</div>
+<ol style="padding-left:22px;"><li><strong>Producer:</strong> Logical value를 locale-independent canonical string으로 만든 뒤 quote 규칙을 적용하고, 마지막에 UTF-8 bytes로 encode한다.</li><li><strong>Staging:</strong> Writer가 close하기 전 partial bytes는 reader에게 노출하지 않는다. Size·checksum·row count와 contract identity를 기록한다.</li><li><strong>Streaming read:</strong> Chunk boundary가 아니라 quote state를 따라 logical record를 찾는다. Incomplete tail은 malformed complete record와 구분해 PENDING 처리한다.</li><li><strong>Validation:</strong> Header fingerprint, column count, null/empty/missing, type range와 timezone을 contract에 따라 검사한다. Inference는 관측 도구이지 publish contract가 아니다.</li><li><strong>Terminal routing:</strong> 정상 row와 reasoned quarantine 중 하나만 idempotency key로 확정한다.</li><li><strong>Commit:</strong> Reconciliation과 threshold 통과 후 checkpoint와 manifest pointer를 전진시킨다. 이때가 batch 성공 시점이다.</li></ol>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자와 실패 창</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:25%;">소유자</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">소유 상태·불변식·실패 창</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Contract registry</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Immutable dialect/schema version과 호환성 판정을 소유한다. Mutable “latest”만 저장하면 replay 의미가 바뀐다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Framer/parser</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Quote state, byte range, partial buffer와 complete logical record count를 소유한다. Buffer limit 전 무제한 multiline은 memory를 고갈시킨다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Validator</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Header/schema/type/domain 판정과 안정된 reason code를 소유한다. Library exception text를 외부 API로 쓰지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Accepted/reject sinks</strong></td><td style="padding:8px;border:1px solid #d9e6df;">상호 배타적인 terminal state와 unique idempotency key를 소유한다. Sink commit 뒤 checkpoint 전 crash는 replay가 발생한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Checkpoint manager</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Input generation + safe byte/logical-record position을 소유한다. Terminal result보다 먼저 전진하면 data loss다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 CSV parser는 finite-state machine이다</h3>
+<p>핵심 상태는 START_FIELD, IN_UNQUOTED, IN_QUOTED, AFTER_QUOTE다. START_FIELD에서 quote를 만나면 IN_QUOTED로, 일반 문자를 만나면 IN_UNQUOTED로 간다. IN_QUOTED의 delimiter와 newline은 payload다. AFTER_QUOTE에서 같은 quote가 한 번 더 오면 literal quote로 돌아가고, delimiter·record terminator가 오면 field·record를 닫는다. 다른 문자가 오면 strict mode에서는 malformed다.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:23%;">현재 상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">입력</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">동작 / 다음 상태</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">START_FIELD</td><td style="padding:8px;border:1px solid #d9e6df;">quote / delimiter / 문자</td><td style="padding:8px;border:1px solid #d9e6df;">IN_QUOTED / empty field 확정 / IN_UNQUOTED</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">IN_UNQUOTED</td><td style="padding:8px;border:1px solid #d9e6df;">delimiter / terminator / quote</td><td style="padding:8px;border:1px solid #d9e6df;">field 확정 / record 확정 / strict error</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">IN_QUOTED</td><td style="padding:8px;border:1px solid #d9e6df;">delimiter·newline / quote</td><td style="padding:8px;border:1px solid #d9e6df;">payload 유지 / AFTER_QUOTE</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">AFTER_QUOTE</td><td style="padding:8px;border:1px solid #d9e6df;">quote / delimiter / terminator / 기타</td><td style="padding:8px;border:1px solid #d9e6df;">literal quote / field 확정 / record 확정 / strict error</td></tr>
+</table>
+<p>정상 입력의 시간 복잡도는 bytes 수 <em>n</em>에 대해 O(n)이다. 하지만 공격자가 closing quote 없이 매우 긴 stream을 보내면 record buffer가 무한히 커질 수 있다. 따라서 max record/field bytes와 streaming spill 또는 bounded quarantine가 correctness 조건이다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Decode와 tokenization 순서를 지킨다</h3>
+<p>Delimiter와 quote는 문자 규칙이므로 먼저 명시적 encoding으로 strict decode해야 한다. Invalid UTF-8을 replacement character로 바꾼 뒤 파싱하면 byte 증거와 field 값이 달라진다. BOM은 encoding layer에서 한 번만 처리한다. Byte chunk 끝에서 multi-byte code point가 잘릴 수 있으므로 incremental decoder 상태도 record parser와 별도로 유지한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Physical line과 logical record를 분리한다</h3>
+<p><code>splitlines()</code>는 quote state를 모르므로 multiline field를 둘로 찢는다. 병렬 split도 arbitrary byte offset에서 시작하면 quoted newline 안인지 알 수 없다. 안전한 분할은 quote-aware pre-scan, side index, 파일 시작부터 state 전파, 또는 quote 내 newline을 금지한 별도 계약이 필요하다. 큰 CSV가 Parquet보다 병렬 scan하기 어려운 이유 중 하나다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Null·empty·missing은 서로 다른 상태다</h3>
+<p><code>,,</code>의 가운데 field는 present하지만 length 0인 empty다. Row 끝에서 column 자체가 없으면 missing이다. <code>\N</code>을 null token으로 정했다면 명시적 null이다. 이 셋을 하나로 합치면 PATCH semantics, 집계 denominator, required validation과 데이터 품질 지표가 깨진다. Quoted <code>""</code>와 unquoted empty를 다르게 보는 엔진도 있어 contract와 golden tests가 필요하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Type inference는 versioned heuristic이다</h3>
+<p>CSV에는 physical integer나 timestamp type tag가 없다. Reader는 lexeme sample을 보고 추정한다. Leading zero identifier, decimal comma, epoch unit, locale date, DST fold/gap은 문자열 모양만으로 domain 의미를 확정할 수 없다. Raw lexeme를 보존하고 schema가 지정한 exact decimal precision, timestamp format과 timezone policy로 변환해야 replay가 재현된다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 호환성은 writer × reader matrix다</h3>
+<p>Delimiter 변경은 모든 old readers를 깨뜨리는 문법 변경이다. 마지막 optional column 추가는 old reader가 extra fields를 reject하는지 무시하는지에 따라 결과가 갈린다. Header rename은 위치 기반 reader에는 통과해도 이름 기반 reader를 깨뜨린다. 따라서 “CSV니까 호환”이 아니라 old/new writer bytes를 old/new reader config에 넣는 2×2 golden matrix로 판정한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단: 계약서에 무엇을 적을까</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:27%;">계약 항목</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">권장 명세와 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Identity</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Contract name/version, owner, effectiveFrom, writer build, compatibility policy를 immutable하게 기록한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Bytes</strong></td><td style="padding:8px;border:1px solid #d9e6df;">UTF-8 여부, BOM allow/forbid, compression, checksum, max file/record/field bytes를 명시한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Dialect</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Delimiter, quoteChar, doubleQuote, escapeChar, lineTerminator, multiline 허용, whitespace policy를 고정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Header</strong></td><td style="padding:8px;border:1px solid #d9e6df;">존재·정확한 순서·case·duplicate/unknown/missing 정책과 header fingerprint를 정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Presence</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Null token, empty string, missing column, quoted empty를 각각 어떤 logical state로 매핑하는지 적는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Column name/order, exact type, decimal precision/scale, date format, timezone/offset, range와 required를 명시한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Error policy</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Strictness, stable reason codes, file-fatal vs row-quarantine 분류, reject threshold, raw/PII retention을 정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Commit/replay</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Immutable generation, idempotency key, reconciliation, checkpoint order, rollback와 replay 승인 절차를 적는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Conformance</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Golden valid/invalid bytes와 expected rows/reasons를 저장하고 모든 지원 엔진·버전에서 CI로 실행한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">변경 배포 순서와 판단</h3>
+<ol style="padding-left:22px;"><li><strong>문법 옵션을 runtime inference로 두지 않는다.</strong> Sniffer는 onboarding 제안과 관측에만 쓰고 production reader는 versioned contract를 사용한다.</li><li><strong>Additive column도 consumer 정책을 먼저 조사한다.</strong> Extra-column reject reader가 하나라도 있으면 먼저 dual-read/new reader를 배포한다.</li><li><strong>Breaking dialect 변경은 새 contract와 새 path/topic으로 낸다.</strong> 같은 이름 아래 delimiter를 바꾸지 않는다.</li><li><strong>Canary + shadow parse를 한다.</strong> Old/new reader의 row count, reject reasons, null ratio, aggregates를 같은 immutable input에서 비교한다.</li><li><strong>원자적 pointer 전환과 rollback을 준비한다.</strong> 새 bytes를 기존 key에 덮어쓰지 않고 last-known-good contract/output을 유지한다.</li></ol>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern·edge case·engine 차이</h3>
+<ul style="padding-left:22px;"><li><strong><code>line.split(',')</code>:</strong> Quote 안 delimiter·newline·quote를 처리하지 못한다.</li><li><strong>Dialect sniff를 진실로 사용:</strong> 짧거나 편향된 sample에서 잘못 추정하고 파일 중간 변화도 놓친다.</li><li><strong>Bad row 무조건 skip:</strong> 정상처럼 보이는 silent data loss와 aggregate 축소를 만든다.</li><li><strong>Null token 충돌:</strong> 실제 문자열 <code>NULL</code>이 필요한 domain에서 이를 null token으로 쓰면 정보를 잃는다.</li><li><strong>Header를 trim/lowercase로 자동 수정:</strong> 서로 다른 columns가 충돌하거나 producer drift를 숨길 수 있다.</li><li><strong>Record limit만 설정:</strong> 하나의 giant field, column 폭탄, deep downstream conversion에도 별도 limit이 필요하다.</li><li><strong>Library 기본값 동일성 가정:</strong> Newline, quote strictness, escape, BOM, duplicate header, empty-line 처리와 max field size는 엔진·버전별로 다르다.</li><li><strong>Spreadsheet round-trip:</strong> Leading zero, long integer, date, scientific notation과 encoding이 사용자 모르게 바뀔 수 있다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">열 수 급변, multiline 이후 모든 row 밀림, 첫 header만 불일치, null/empty 비율 변화, row count 감소, 특정 engine만 성공, quote 관련 reject 폭증, 재시도마다 결과가 다름.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">URI+generation/ETag+checksum, 앞 bytes/BOM, 실패 byte range와 quote state, physical/logical line number, declared contract/schema/parser versions, header raw bytes, complete/accepted/rejected/pending counts, reason histogram, producer build, checkpoint와 sink commit log.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Delimiter·quote·escape 변경, unclosed quote, BOM/encoding drift, CRLF/LF 혼합, multiline을 physical split, header rename/duplicate, null token 충돌, inference sample 변화, partial upload, parser library upgrade, mutable overwrite.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Publish와 checkpoint를 멈추고 정확한 input generation·old/new contract·reader binary를 보존한다. 실패 boundary 주변 raw bytes를 hex로 확인하고 golden parser로 quote state, header, counts와 reason을 offline 재현한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good writer/contract/reader로 rollback한다. 확정 checkpoint 전 안전한 logical boundary부터 idempotent replay하고, 새 run의 reconciliation·null ratio·business aggregate를 검증한 뒤 immutable output pointer를 전환한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">무작위 delimiter fallback, invalid bytes replacement, physical line skip, 원본 수정/덮어쓰기, reject 삭제, checkpoint 강제 전진, parser upgrade 즉석 적용, idempotency 없는 전체 재처리, threshold만 높여 alert 숨기기를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: executable CSV dialect contract</h2>
+<p><strong>목표:</strong> Contract JSON, multiline·delimiter·quote·null이 있는 valid bytes와 malformed bytes를 만들고 strict parser·schema gate·reconciliation으로 판정한다.</p>
+<p><strong>사전 조건:</strong> Python 3 표준 library만 필요하다. 정확한 임시 경로 <code>/tmp/file-format-day14</code>만 사용한다.</p>
+<p><strong>실행 전 예측:</strong> Valid 파일은 header를 제외하고 logical records 3개다. Physical newline은 multiline field 때문에 더 많다. Naive split 결과와 strict parser 결과, null과 empty가 각각 어떻게 남는지 먼저 적는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.1 계약·fixture·검증기 생성</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>mkdir -p /tmp/file-format-day14
+cd /tmp/file-format-day14
+
+python3 - &lt;&lt;'PY'
+from pathlib import Path
+import json
+
+contract = {
+  "contractVersion": "orders-csv/2.0.0",
+  "encoding": "utf-8-sig",
+  "delimiter": ",",
+  "quoteChar": "\&quot;",
+  "doubleQuote": True,
+  "escapeChar": None,
+  "lineTerminator": "CRLF",
+  "header": ["id", "comment", "amount", "occurred_at"],
+  "nullTokens": ["\\N"],
+  "emptyStringIsNull": False,
+  "multiline": True,
+  "maxRecordBytes": 1024,
+  "strict": True
+}
+Path("contract.json").write_text(
+  json.dumps(contract, ensure_ascii=False, indent=2), encoding="utf-8")
+
+valid = (
+  '\ufeffid,comment,amount,occurred_at\r\n'
+  '1,"hello,world",12.50,2026-08-15T09:00:00+09:00\r\n'
+  '2,"line1\r\nline2",\\N,2026-08-15T00:00:00Z\r\n'
+  '3,"He said ""OK""",0,2026-08-15T01:00:00Z\r\n'
+)
+Path("valid.csv").write_bytes(valid.encode("utf-8"))
+Path("unclosed.csv").write_bytes(
+  Path("valid.csv").read_bytes() + b'4,"unterminated,1,2026-08-15T00:00:00Z\r\n')
+Path("extra-column.csv").write_bytes(
+  Path("valid.csv").read_bytes() + b'4,ok,1,2026-08-15T00:00:00Z,EXTRA\r\n')
+print("fixtures-created")
+PY
+
+python3 - &lt;&lt;'PY'
+from pathlib import Path
+parser = r'''import csv, json, sys
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+
+c = json.load(open("contract.json", encoding="utf-8"))
+expected = c["header"]
+
+def validate(row):
+    if len(row) != len(expected): raise ValueError("COLUMN_COUNT")
+    data = dict(zip(expected, row))
+    if data["id"] == "" or not data["id"].isdigit(): raise ValueError("ID_TYPE")
+    if data["amount"] in c["nullTokens"]: data["amount"] = None
+    else:
+        try: data["amount"] = str(Decimal(data["amount"]))
+        except InvalidOperation: raise ValueError("AMOUNT_TYPE")
+    try:
+        ts = datetime.fromisoformat(data["occurred_at"].replace("Z", "+00:00"))
+        if ts.tzinfo is None: raise ValueError
+    except ValueError: raise ValueError("TIMESTAMP")
+    return data
+
+path = sys.argv[1]
+accepted, rejected = [], []
+try:
+    with open(path, encoding=c["encoding"], newline="") as f:
+        reader = csv.reader(f, delimiter=c["delimiter"], quotechar=c["quoteChar"],
+          doublequote=c["doubleQuote"], escapechar=c["escapeChar"], strict=c["strict"])
+        header = next(reader)
+        if header != expected: raise ValueError("HEADER_CONTRACT")
+        for logical_no, row in enumerate(reader, 2):
+            try: accepted.append(validate(row))
+            except ValueError as e: rejected.append((logical_no, str(e), row))
+except (csv.Error, UnicodeError, ValueError) as e:
+    print(path, "FILE_REJECT", type(e).__name__, str(e)); raise SystemExit(2)
+
+print(path, "accepted=", len(accepted), "rejected=", len(rejected))
+print("comments=", [x["comment"] for x in accepted])
+print("amounts=", [x["amount"] for x in accepted])
+print("reasons=", rejected)
+assert len(accepted) + len(rejected) == (3 if path == "valid.csv" else 4)
+'''
+Path("validate.py").write_text(parser, encoding="utf-8")
+PY
+
+python3 validate.py valid.csv</code></div>
+<p><strong>예상 관찰:</strong> Accepted 3, rejected 0이다. 두 번째 comment에는 실제 newline이 보존되고 amount는 null, empty string은 별도 값으로 남는다. Quote 안 comma와 doubled quote도 원래 값으로 복원된다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 잘못된 접근과 실패 주입</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+from pathlib import Path
+text = Path("valid.csv").read_text(encoding="utf-8-sig")
+naive = [line.split(",") for line in text.splitlines()]
+print("physical_lines=", len(naive))
+print("naive_column_counts=", [len(row) for row in naive])
+PY
+
+python3 validate.py unclosed.csv || echo "expected: file-level quote failure"
+python3 validate.py extra-column.csv || true
+
+python3 - &lt;&lt;'PY'
+import csv
+with open("valid.csv", encoding="utf-8-sig", newline="") as f:
+    rows = list(csv.reader(f, delimiter=";", quotechar='"', strict=True))
+print("wrong-dialect column counts=", [len(x) for x in rows])
+assert any(len(x) != 4 for x in rows)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Naive split은 quote 안 comma와 multiline을 깨뜨려 row별 column 수가 달라진다. Unclosed quote는 file-level framing 불확실성이라 strict parser가 파일을 거부한다. Extra column은 syntax상 읽혀도 schema validation에서 해당 row를 <code>COLUMN_COUNT</code>로 quarantine한다. Wrong delimiter는 대부분 한 column으로 읽혀 header gate에서 차단돼야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 자주 나는 오류와 해결·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>첫 header가 <code>\ufeffid</code>:</strong> Contract가 BOM을 허용하므로 <code>utf-8-sig</code>로 decode한다. 금지 계약이면 publish 전에 reject한다.</li><li><strong>Multiline이 두 records:</strong> 파일을 <code>splitlines()</code>로 먼저 자르지 말고 <code>newline=""</code> stream을 CSV parser에 준다.</li><li><strong>Unclosed quote가 memory 증가:</strong> Production framer에는 maxRecordBytes와 bounded evidence buffer를 둔다. 표준 library 호출 전 upstream byte limit도 필요하다.</li><li><strong>Engine마다 결과 차이:</strong> 동일 golden bytes와 expected records/reasons를 각 engine CI에서 검증한다.</li></ul>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>cd /tmp
+test -d /tmp/file-format-day14 &amp;&amp; rm -rf -- /tmp/file-format-day14
+test ! -e /tmp/file-format-day14 &amp;&amp; echo cleaned</code></div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>RFC의 common format만 적고 실제 producer의 BOM·newline·null·header 정책을 생략하지 않는다.</li><li>문법이 valid한 row와 schema/domain이 valid한 row를 구분한다.</li><li>Partial tail을 bad complete record로 확정하지 않는다. Writer close·object generation 상태를 확인한다.</li><li>Quoted newline을 허용하면서 arbitrary byte split 병렬 처리를 약속하지 않는다.</li><li>Reject reason ordering을 고정한다. Encoding 실패를 syntax 실패로, column count를 type 실패로 바꾸면 운영 지표가 흔들린다.</li><li>Parser exception message를 stable reason code로 쓰지 않는다.</li><li>Raw quarantine에도 정상 data와 같은 PII encryption·ACL·retention·audit를 적용한다.</li><li>계약 변경 후 accepted count만 보지 말고 null ratio, per-column rejects, sum·distinct·time distribution을 비교한다.</li><li>CSV를 table transaction으로 착각하지 않는다. Multi-file snapshot, atomic commit, delete/update는 상위 table/catalog 계층 책임이다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. 하루 5TB CSV ingestion contract를 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Row 수·file size·SLO·producer 수·multiline 필요성을 먼저 수치화한다 → encoding/dialect/header/null/schema/limits contract를 정의한다 → quote-aware bounded streaming과 split 전략을 설명한다 → accepted/quarantine reconciliation·idempotency·checkpoint를 둔다 → shadow parse, reject budget, PII retention, rollback과 CSV→columnar 변환 대안을 비용으로 비교한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. CSV 파일을 병렬로 N등분해 읽으면 왜 틀릴 수 있습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Physical byte offset과 logical record boundary를 분리한다 → arbitrary offset이 IN_QUOTED 상태일 수 있음을 예로 든다 → quote-aware index/pre-scan, state propagation, multiline 금지 계약, 단일 framer+downstream parallelism 대안을 비교한다 → O(n) scan·latency·memory·복구 단위 trade-off를 말한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Delimiter 변경을 무중단 배포하려면 어떻게 합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> 같은 path의 silent mutation을 금지한다 → old/new writer × old/new reader 2×2 호환 matrix를 만든다 → new reader dual-read와 metrics를 먼저 배포한다 → versioned path/contract로 canary·shadow compare한다 → immutable output pointer를 원자 전환하고 last-known-good rollback·idempotent replay를 준비한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제: quarantine parser</h3>
+<ol style="padding-left:22px;"><li>검사를 byte size → encoding → syntax → schema → domain 순으로 하는 이유는?</li><li>Quarantine record에 재현·재처리를 위해 필요한 최소 evidence는?</li><li>Sink commit 뒤 checkpoint 전 crash에서 중복과 유실을 어떻게 막는가?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Quote 안 newline을 포함한 CSV에서 physical line과 logical record가 다른 이유를 state transition으로 설명하라.</li><li>CSV dialect contract에 반드시 포함할 항목을 bytes·문법·schema·운영 네 계층으로 나눠 말하라.</li><li>Delimiter 변경의 호환성을 어떤 matrix와 지표로 검증하고 어떻게 rollback할 것인가?</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Resource와 raw 증거를 먼저 보호하고 가장 근본적이고 안정된 terminal reason을 부여하기 위해서다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Source generation, byte range, raw/digest, reason, parser/schema/config version, run/idempotency key가 핵심이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Checkpoint는 terminal commit 뒤에 쓰고 generation+offset 같은 unique key로 replay가 같은 결과에 수렴하게 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">IN_QUOTED의 newline은 payload이고 quote가 닫힌 뒤의 terminator만 record를 확정하므로 physical line split은 상태를 잃는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Bytes: encoding/BOM/limits, 문법: delimiter/quote/escape/newline/header, schema: columns/null/type/timezone, 운영: version/errors/reconciliation/checkpoint/replay다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Old/new writer×reader golden matrix와 row/reject/null/aggregate 비교 후 versioned pointer를 전환하고 old contract/output으로 rollback한다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. 오늘 답변에서 수치 가정, state machine, failure window, 관측 지표, 대안과 rollback 중 4개 이상을 연결하면 면접 Level 3다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Week 2 closed-book 최종 점검</h3>
+<ol style="padding-left:22px;"><li>Delimiter·quote·escape·multiline을 state machine으로 그린다.</li><li>Null·empty·missing을 SQL, patch, aggregate 관점에서 분리한다.</li><li>JSON number 정밀도와 duplicate key 정책을 설명한다.</li><li>JSON array와 NDJSON의 framing·split·partial tail 차이를 말한다.</li><li>Locale/timezone inference가 재현성을 깨는 예를 든다.</li><li>Malformed record의 reason taxonomy와 quarantine evidence를 설계한다.</li><li>CSV dialect contract, 호환 matrix, canary, rollback을 한 번에 방어한다.</li></ol>
+<p><strong>리뷰 루브릭:</strong> Level 1은 용어와 장단점 나열, Level 2는 bytes→parser state→logical value를 연결, Level 3은 workload 수치·불변식·failure window·관측 지표·대안·rollback까지 방어한다. 7개 중 5개 이상 Level 2, 2개 이상 Level 3이면 Week 2 통과다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://www.rfc-editor.org/rfc/rfc4180.html" style="color:#126246;">RFC 4180 — Common Format and MIME Type for CSV</a>: Common CSV의 records, fields, quote와 embedded newline 규칙을 확인한다.</li><li><a href="https://www.rfc-editor.org/rfc/rfc7111.html" style="color:#126246;">RFC 7111 — URI Fragment Identifiers for text/csv</a>: Header 파라미터와 row/column 식별 시 논리 구조를 확인한다.</li><li><a href="https://docs.python.org/3/library/csv.html" style="color:#126246;">Python 공식 csv 문서</a>: Dialect, <code>newline=""</code>, strict와 field size limit 동작을 확인한다.</li><li><a href="https://www.w3.org/TR/tabular-data-model/" style="color:#126246;">W3C Model for Tabular Data and Metadata on the Web</a>: CSV bytes 밖의 metadata·datatype·null·schema 계약을 확장해 본다.</li></ul>
+<p style="font-size:14px;color:#53635c;">RFC 4180은 현장의 모든 CSV dialect를 완전히 규정하지 않는다. 사용하는 producer와 engine/library version, 명시적 옵션, golden bytes를 함께 검증한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 3 · Day 15 — binary serialization, varint, zig-zag</strong><br>Text token을 읽던 관점에서 binary wire format으로 이동한다. Integer가 bytes에 놓이는 방식, length-delimited framing, varint의 CPU/크기 trade-off와 schema evolution의 토대를 다룬다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · explicit dialect, deterministic parse, recoverable change</td></tr>
+</table></td></tr></table></body></html>
