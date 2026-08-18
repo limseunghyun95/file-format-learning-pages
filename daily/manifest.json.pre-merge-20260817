@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-18T09:20:06+09:00",
+  "updatedAt": "2026-08-11T09:35:05+09:00",
   "lessons": [
     {
       "day": 1,
@@ -104,51 +104,6 @@
       "path": "day-11.html",
       "kind": "lesson",
       "publishedAt": "2026-08-11T09:35:05+09:00"
-    },
-    {
-      "day": 12,
-      "week": 2,
-      "title": "type inference와 locale/timezone 위험",
-      "summary": "Type inference를 raw lexeme의 versioned 해석 과정으로 보고 locale 숫자, ambiguous date, epoch unit, DST fold/gap과 tzdb 재현성을 strict contract로 설계합니다.",
-      "path": "day-12.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-12T09:10:53+09:00"
-    },
-    {
-      "day": 13,
-      "week": 2,
-      "title": "랩: malformed record quarantine parser",
-      "summary": "Invalid UTF-8, oversize, duplicate key, schema drift와 bad timestamp를 격리하며 accepted+rejected reconciliation, idempotent sink와 checkpoint 순서를 통합 실습합니다.",
-      "path": "day-13.html",
-      "kind": "lab",
-      "publishedAt": "2026-08-14T09:19:41+09:00"
-    },
-    {
-      "day": 14,
-      "week": 2,
-      "title": "회상: CSV dialect contract 작성",
-      "summary": "CSV dialect를 encoding·parser state·schema·운영 계약으로 명세하고 호환 matrix, quarantine, checkpoint와 rollback까지 Week 2 전체 지식으로 방어합니다.",
-      "path": "day-14.html",
-      "kind": "review",
-      "publishedAt": "2026-08-15T09:10:17+09:00"
-    },
-    {
-      "day": 15,
-      "week": 3,
-      "title": "binary serialization, varint, zig-zag",
-      "summary": "Logical integer가 zig-zag·varint·field key·length framing을 거쳐 wire bytes가 되는 경로와 bounded decoder, unknown field, failure window를 byte 단위로 학습합니다.",
-      "path": "day-15.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-16T09:07:54+09:00"
-    },
-    {
-      "day": 16,
-      "week": 3,
-      "title": "Avro writer/reader schema resolution",
-      "summary": "Exact writer schema로 bytes를 걷고 reader schema의 name·alias·promotion·skip·default 규칙으로 object를 구성하는 resolution path와 registry failure 복구를 학습합니다.",
-      "path": "day-16.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-18T09:20:06+09:00"
     }
   ]
 }

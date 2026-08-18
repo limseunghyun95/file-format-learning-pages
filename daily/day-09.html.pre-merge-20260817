@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 09</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;">
+<div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 2 / DAY 09</div>
+<h1 style="margin:8px 0 8px;font-size:27px;line-height:1.32;color:#ffffff;">null·empty·missing의 의미 차이</h1>
+<div style="font-size:15px;color:#d8eee5;">Presence semantics에서 validity bitmap·SQL·patch까지 · 예상 학습 45분 + 실습 30분</div>
+</td></tr>
+<tr><td style="padding:24px;">
+
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br><code>null</code>은 값이 없음을 명시한 상태, empty는 길이 0인 실제 값, missing은 field 자체가 전달되지 않은 상태다. 이 셋을 하나로 합치면 update·aggregate·schema evolution에서 되돌릴 수 없는 의미 손실이 생긴다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:28%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Null</strong></td><td style="padding:9px;border:1px solid #d9e6df;">해당 slot/field의 값이 없다는 명시적 상태다. 숫자 0이나 빈 문자열과 다른 별도 의미다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Empty string</strong></td><td style="padding:9px;border:1px solid #d9e6df;">길이가 0인 유효한 string 값 <code>""</code>이다. 값은 존재하며 null이 아니다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Missing</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Object/message에 field 자체가 나타나지 않은 상태다. “전달하지 않음”이므로 patch에서는 기존 값을 유지한다는 뜻일 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Zero / false</strong></td><td style="padding:9px;border:1px solid #d9e6df;">각 type의 실제 값이다. Falsy하게 평가될 수 있어도 absence가 아니다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Presence</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Field가 메시지나 row에 제공됐는지를 나타내는 정보다. Value와 분리된 한 bit의 상태로 생각하면 쉽다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Null sentinel</strong></td><td style="padding:9px;border:1px solid #d9e6df;">CSV처럼 null 표현이 내장되지 않은 형식에서 <code>\N</code> 같은 특별 문자열로 null을 나타내는 계약이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Validity bitmap</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Column vector의 각 slot이 유효한지 나타내는 bit 배열이다. 보통 1은 값 있음, 0은 null이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Three-valued logic</strong></td><td style="padding:9px;border:1px solid #d9e6df;">SQL 조건 결과가 TRUE/FALSE뿐 아니라 UNKNOWN(NULL 관련 비교)까지 갖는 논리 체계다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Default</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Field가 없을 때 reader/application이 채우도록 계약한 값이다. Writer가 실제 byte에 쓴 값과 다를 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Patch semantics</strong></td><td style="padding:9px;border:1px solid #d9e6df;">부분 update에서 missing/null/value가 각각 유지/삭제/설정 중 무엇을 뜻하는지 정한 규칙이다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>고객 nickname을 예로 들면 missing은 “이 요청에서는 nickname을 건드리지 않음”, null은 “기존 nickname 삭제”, empty string은 “사용자가 빈 문자열로 설정”일 수 있다. Ingestion 단계에서 셋을 모두 null로 바꾸면 원래 의도를 복구할 수 없다.</p>
+<p>분석에서도 차이는 크다. SQL의 <code>COUNT(nickname)</code>은 null을 제외하지만 empty string은 센다. <code>nickname = NULL</code>은 TRUE가 아니라 UNKNOWN이므로 <code>IS NULL</code>을 써야 한다. Join key·distinct count·data quality ratio·ML feature에서도 결과가 달라진다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>면접 기준:</strong> null을 “빈 값”이라고만 설명하지 말고, format별 표현 → memory layout → SQL 실행 → API update → schema evolution → 장애 복구까지 방어해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Raw representation</strong><br>CSV token · JSON key/null · binary presence</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ syntax parse + quote/presence provenance</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Presence classifier</strong><br>MISSING / NULL / VALUE(empty 포함)</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ schema + null marker + defaults (control path)</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Typed column / object</strong><br>validity bitmap + offsets + values</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ filter · aggregate · join · patch</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Business semantics</strong><br>UNKNOWN · preserve · clear · set · default</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ invariant + sink/reject atomic commit</td></tr>
+<tr><td style="padding:12px 7px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Durable state</strong><br>data + schema version + presence metrics + lineage</td></tr>
+</table>
+
+<ol style="padding-left:22px;">
+<li><strong>Parse:</strong> CSV에서는 field token과 quote 여부, JSON에서는 key 존재와 value를 읽는다. 이때 syntax가 제공한 presence 증거를 버리지 않는다.</li>
+<li><strong>Classify:</strong> Missing/null/value를 구분한다. Empty string은 VALUE의 한 종류다. CSV null sentinel은 schema/dialect contract로만 해석한다.</li>
+<li><strong>Materialize:</strong> Typed column은 validity bitmap과 values/offsets를 분리할 수 있다. Null slot의 value buffer 내용은 의미가 없고 bitmap이 진실의 소유자다.</li>
+<li><strong>Execute:</strong> SQL aggregate·join·filter 또는 API patch가 presence 상태별 규칙을 적용한다. <code>COALESCE</code>는 명시적 business decision이지 자동 정리 단계가 아니다.</li>
+<li><strong>Commit:</strong> Input 상태별 count와 변환·default 적용 지표, schema version을 data와 함께 기록한다. Sink와 reject가 완료된 뒤 checkpoint한다.</li>
+</ol>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자와 불변식</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;width:30%;font-weight:700;">Producer</td><td style="padding:9px;border:1px solid #d9e6df;">Field presence, explicit null, empty value, null sentinel escaping과 schema version을 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Contract / registry</td><td style="padding:9px;border:1px solid #d9e6df;">Nullable, required, default, missing policy와 patch semantics를 version별로 정의한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Reader / transformer</td><td style="padding:9px;border:1px solid #d9e6df;">Syntax provenance 보존, typed conversion, validity bitmap과 reject reason을 소유한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">핵심 불변식</td><td style="padding:9px;border:1px solid #d9e6df;">명시적 mapping 없이 MISSING, NULL, EMPTY, ZERO/FALSE를 합치지 않는다. 변환 전후 각 상태의 count가 추적 가능해야 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">성공 시점</td><td style="padding:9px;border:1px solid #d9e6df;">Presence별 invariant와 downstream count/aggregate가 검증되고 data·reject·checkpoint가 원자적으로 확정된 때다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작: absence도 저장해야 하는 정보다</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 CSV에는 보편적인 null byte가 없다</h3>
+<p><code>a,,c</code>의 가운데 field는 길이 0인 token이다. 그것이 null인지 empty string인지는 dialect/schema가 결정한다. <code>a,"",c</code>는 syntax상 quoted empty라는 provenance가 있지만 많은 library는 둘 다 Python <code>""</code>로 반환해 quote 여부를 잃는다. 따라서 “quoted empty는 empty, unquoted empty는 null”을 요구하면 parser가 quote provenance를 보존하는지 검증해야 한다.</p>
+<p><code>\N</code>, <code>NULL</code> 같은 sentinel을 쓰면 실제 문자열과 충돌할 수 있다. Reserved sentinel, escape 규칙, nullable column별 적용 범위를 계약하고 round-trip golden test를 둔다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 JSON은 null과 missing을 표현하지만 application이 합칠 수 있다</h3>
+<p><code>{"nickname": null}</code>, <code>{"nickname": ""}</code>, <code>{}</code>는 서로 다르다. 그러나 DTO/deserializer가 missing field에 null default를 넣으면 첫 번째와 세 번째가 합쳐진다. Patch API는 key membership을 별도로 검사하거나 tri-state wrapper를 사용해야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Validity bitmap과 empty string offsets</h3>
+<p>Arrow식 variable-length string column은 validity bitmap, offsets, data bytes를 분리한다. 예를 들어 <code>["A", null, ""]</code>의 offsets는 개념적으로 <code>[0,1,1,1]</code>일 수 있다. Null과 empty 모두 data bytes를 소비하지 않지만, null slot의 validity bit는 0이고 empty string은 1이다. 즉 length/offset만으로 둘을 구분할 수 없다.</p>
+<p>Validity bitmap은 1 slot당 1 bit이므로 null 여부를 compact하게 저장하고 vectorized operator가 word 단위로 처리할 수 있다. 하지만 null-heavy branch, bitmap combination, nested validity는 CPU 비용을 만든다. Null slot의 value buffer를 읽어 의미를 추론하면 안 된다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Parquet nested data의 definition level</h3>
+<p>Columnar nested format은 null/empty/missing 구조를 단순 value stream만으로 복원할 수 없다. Definition level은 optional path가 어느 깊이까지 존재하는지 나타내고, repetition level은 repeated element 경계를 나타낸다. Null list, empty list, list 안 null element는 서로 다른 level pattern을 갖는다. Reader가 level stream을 잃으면 값 bytes가 없어 보이는 여러 상태를 구분할 수 없다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 SQL three-valued logic</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:28%;">표현</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">결과 / 의미</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>NULL = NULL</code></td><td style="padding:8px;border:1px solid #d9e6df;">UNKNOWN. Null 판별은 <code>IS NULL</code>을 사용한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>COUNT(*)</code></td><td style="padding:8px;border:1px solid #d9e6df;">모든 rows를 센다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>COUNT(col)</code></td><td style="padding:8px;border:1px solid #d9e6df;">col이 non-null인 rows만 센다. Empty string은 포함한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>SUM(col)</code></td><td style="padding:8px;border:1px solid #d9e6df;">보통 null을 제외한다. Empty string의 numeric conversion 정책은 engine별로 다를 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>JOIN a.k = b.k</code></td><td style="padding:8px;border:1px solid #d9e6df;">일반 equality join에서 null keys는 서로 match하지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>COALESCE(col,'')</code></td><td style="padding:8px;border:1px solid #d9e6df;">Null을 empty로 의도적으로 합친다. 원래 구분은 결과에서 사라진다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">4.6 Missing과 schema evolution</h3>
+<p>새 column을 추가했을 때 과거 file에 column 자체가 없는 것과 새 file row의 explicit null은 provenance가 다르다. Reader는 table schema의 default/null 정책으로 둘을 같은 query value로 보일 수 있지만 backfill 여부·producer adoption·data quality 판단에서는 구분이 필요하다. File schema version과 ingestion time, default-applied flag를 관찰한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.7 Patch의 tri-state</h3>
+<p>Partial update에서 field missing은 KEEP, explicit null은 CLEAR, empty/value는 SET으로 모델링한다. 단순 <code>Optional&lt;String&gt;</code> 하나로 missing과 null을 모두 표현하면 상태가 부족하다. Presence bit + nullable value 또는 tagged union이 필요하다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;width:29%;">판단</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#ffffff;text-align:left;">Best practice와 이유</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Domain first</strong></td><td style="padding:9px;border:1px solid #d9e6df;">각 field에서 missing/null/empty/zero가 가능한지와 의미를 먼저 정의한다. Format default에 domain을 맞추지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>CSV null</strong></td><td style="padding:9px;border:1px solid #d9e6df;">충돌하지 않는 sentinel과 escape/round-trip 규칙을 계약한다. Column별 <code>force_not_null</code> 같은 reader 설정 차이를 테스트한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Presence retention</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Raw/validated layer에 source token·key membership·schema version·default applied 여부를 보존한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Patch API</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Missing=keep, null=clear, value=replace를 contract와 tests에 명시한다. Generated DTO가 key presence를 보존하는지 확인한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Analytics</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Null/empty/missing/defaulted 비율을 분리하고 <code>COUNT(*)</code>, <code>COUNT(col)</code>, join/filter 차이를 review한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Evolution</strong></td><td style="padding:9px;border:1px solid #d9e6df;">새 field는 reader-first로 추가하고 old data의 missing 해석, default, backfill, producer adoption을 별도 상태로 추적한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Field·schema·producer version별 null/empty/missing/default/reject count, sudden ratio shift와 sentinel collision을 alert한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern·edge case·engine 차이</h3>
+<ul style="padding-left:22px;">
+<li><strong>Falsy check:</strong> <code>if not value</code>는 null, empty, zero, false를 합친다. Type/presence를 명시적으로 검사한다.</li>
+<li><strong>모든 empty를 null:</strong> 빈 nickname·빈 comment가 유효한 domain이면 의미를 잃는다.</li>
+<li><strong><code>NULL</code> 문자열을 sentinel로 무조건 사용:</strong> 실제 값과 충돌한다. Escape 또는 별도 presence channel이 필요하다.</li>
+<li><strong>Default로 장애 숨김:</strong> Missing required field를 0/empty로 채우면 producer drift가 품질 장애로 바뀐다.</li>
+<li><strong><code>COALESCE</code> 남용:</strong> Query는 편해지지만 원래 absence 상태와 품질 지표를 잃는다.</li>
+<li><strong>CSV quote로 null/empty 구분 가정:</strong> Parser가 quote provenance를 버릴 수 있다. 실제 library round-trip을 검증한다.</li>
+<li><strong>Engine 동일성 가정:</strong> CSV null string, empty numeric cast, NaN, JSON missing, join null behavior의 surface option은 engine/version별로 다를 수 있다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Null ratio 급증, empty string 소실, required field가 default 0으로 증가, <code>COUNT(*)</code>와 <code>COUNT(col)</code> 격차 변화, join match 감소, patch 요청 후 값이 의도치 않게 삭제/유지, schema version별 결과 차이.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">원본 bytes/JSON keys, quote·token provenance, null sentinel·dialect·schema version, writer/reader build와 config, null/empty/missing/defaulted/reject count, field-count histogram, query plan/SQL, patch payload와 before/after, 정상 sample.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Null marker 변경/충돌, parser default 변화, quote provenance 손실, DTO가 missing을 null로 초기화, <code>COALESCE</code>/trim/cast 추가, schema default 적용, writer field 누락, backfill 혼재, engine upgrade behavior 차이.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">영향 producer/schema version과 transform 배포를 격리하고 checkpoint를 멈춘다. 원본을 보존해 tri-state golden rows를 old/new reader로 비교하고 상태별 count가 합쳐지는 최초 단계를 찾는다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good contract/reader/transform으로 rollback한다. Presence-preserving fix를 새 output version에 적용하고 null/empty/missing/defaulted count와 downstream aggregate·patch 결과를 검증해 idempotent replay한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">모든 null을 empty/0으로 일괄 치환, 원본 덮어쓰기, sentinel 문자열 삭제, <code>COALESCE</code>로 지표 숨기기, missing을 default로 조용히 채우기, patch 재실행 전 idempotency 무시, 실패 batch checkpoint commit을 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 30분 실습: tri-state를 끝까지 보존하기</h2>
+<p><strong>목표:</strong> CSV empty/sentinel과 JSON missing/null/empty/zero를 비교하고 SQL aggregate와 patch 결과가 어떻게 달라지는지 관찰한다. 실행 전 각 상태가 count와 update에 미칠 결과를 적는다.</p>
+<p><strong>사전 조건:</strong> Python 3 표준 library만 필요하다. 정확한 임시 경로 <code>/tmp/file-format-day09</code>만 사용한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.1 CSV: empty token과 null sentinel</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>mkdir -p /tmp/file-format-day09
+cd /tmp/file-format-day09
+
+python3 - &lt;&lt;'PY'
+import csv
+
+rows = [
+    ["id", "nickname"],
+    ["1", ""],
+    ["2", r"\N"],
+    ["3", "0"],
+    ["4", "NULL"],
+]
+with open("presence.csv", "w", encoding="utf-8", newline="") as f:
+    csv.writer(f).writerows(rows)
+
+with open("presence.csv", encoding="utf-8", newline="") as f:
+    for row in csv.DictReader(f):
+        raw = row["nickname"]
+        value = None if raw == r"\N" else raw
+        print(row["id"], "raw=", repr(raw), "typed=", repr(value))
+PY
+
+xxd -g 1 presence.csv</code></div>
+<p><strong>예상:</strong> Empty는 <code>''</code>, sentinel <code>\N</code>만 null, <code>'0'</code>과 <code>'NULL'</code>은 실제 strings다. Sentinel을 <code>NULL</code>로 바꾸면 row 4의 실제 값과 충돌한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 JSON: missing, null, empty, zero</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+MISSING = object()
+rows = [
+    {"id": 1},
+    {"id": 2, "nickname": None},
+    {"id": 3, "nickname": ""},
+    {"id": 4, "nickname": 0},
+]
+for row in rows:
+    v = row.get("nickname", MISSING)
+    state = ("MISSING" if v is MISSING else
+             "NULL" if v is None else
+             "EMPTY" if v == "" else "VALUE")
+    print(row["id"], state, repr(v) if v is not MISSING else "-")
+PY</code></div>
+<p><strong>예상:</strong> Key membership을 확인하면 네 상태가 보존된다. <code>row.get("nickname")</code>만 사용하면 missing과 explicit null이 모두 <code>None</code>이 되어 합쳐진다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 SQL count와 three-valued logic</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.execute("create table t(id integer, nickname text)")
+db.executemany("insert into t values (?, ?)", [
+    (1, None), (2, ""), (3, "0"), (4, "Alice")
+])
+print("counts", db.execute(
+    "select count(*), count(nickname), "
+    "sum(nickname is null), sum(nickname = '') from t"
+).fetchone())
+print("equals-null", db.execute(
+    "select count(*) from t where nickname = null"
+).fetchone()[0])
+print("is-null", db.execute(
+    "select count(*) from t where nickname is null"
+).fetchone()[0])
+PY</code></div>
+<p><strong>예상:</strong> <code>COUNT(*)=4</code>, <code>COUNT(nickname)=3</code>, null 1, empty 1이다. <code>= NULL</code>은 0 rows, <code>IS NULL</code>은 1 row를 찾는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.4 Patch semantics와 실패 주입</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def apply_patch(current, patch):
+    out = dict(current)
+    if "nickname" in patch:
+        out["nickname"] = patch["nickname"]
+    return out
+
+base = {"nickname": "Alice"}
+for patch in ({}, {"nickname": None}, {"nickname": ""}):
+    print("patch", patch, "=&gt;", apply_patch(base, patch))
+
+def broken_patch(current, patch):
+    out = dict(current)
+    out["nickname"] = patch.get("nickname")
+    return out
+print("BROKEN missing =&gt;", broken_patch(base, {}))
+PY</code></div>
+<p><strong>예상:</strong> Empty patch는 KEEP, null은 CLEAR, empty string은 SET empty다. 실패 주입 함수는 missing key를 <code>None</code>으로 바꿔 의도치 않게 삭제한다.</p>
+<p><strong>자주 나는 오류와 해결:</strong> Shell/Python에서 <code>\N</code> escape가 혼동되면 raw string을 사용하고 hex를 확인한다. SQLite는 SQL semantics 관찰용이며 production engine의 cast/null option은 공식 문서와 golden query로 다시 검증한다. Quoted/unquoted empty를 구분하려면 사용하는 CSV parser가 quote provenance를 제공하는지 확인한다.</p>
+<p><strong>Cleanup:</strong> 현재 경로와 정확한 대상 directory를 확인한 뒤 실습 파일만 제거한다.</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>pwd
+test "$(pwd)" = "/tmp/file-format-day09" &amp;&amp; cd /tmp
+test -d /tmp/file-format-day09 &amp;&amp; rm -rf -- /tmp/file-format-day09</code></div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px;">
+<li><strong>Null은 값:</strong> Null은 일반 scalar 값이 아니라 absence 상태라 equality와 aggregate 규칙이 다르다.</li>
+<li><strong>Missing은 null:</strong> Reader default나 DTO 초기화가 합칠 수 있지만 source semantics는 다르다.</li>
+<li><strong>Empty string은 zero:</strong> Type과 domain이 다르다. 자동 cast는 engine별로 실패하거나 다른 결과를 낸다.</li>
+<li><strong>Null slot의 values buffer 신뢰:</strong> Validity bit가 0이면 buffer 내용은 의미가 없을 수 있다.</li>
+<li><strong>Old file missing column=producer null:</strong> Schema evolution provenance와 adoption 판단을 잃는다.</li>
+<li><strong>Default 적용 후 표시 안 함:</strong> 실제 source value와 reader-supplied value를 구분할 수 없다.</li>
+<li><strong>Patch DTO를 일반 create DTO와 공유:</strong> Presence 상태 수가 달라 의도치 않은 clear/keep이 생긴다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. CSV의 빈 field를 null로 읽어도 됩니까?</h3>
+<p><strong>좋은 답변 구조:</strong> ① Domain에서 empty/null 의미를 먼저 질문 ② CSV에는 보편 null 표현이 없다고 정의 ③ unquoted/quoted empty와 parser provenance 한계 ④ sentinel·escape·column schema 계약 ⑤ writer→parser→typed validity bitmap 경로 ⑥ null/empty ratio·round-trip golden test ⑦ JSON/Avro처럼 presence를 더 잘 표현하는 대안과 migration을 제시한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q2. 새 nullable column을 추가한 뒤 null ratio가 95%입니다. 장애입니까?</h3>
+<p><strong>좋은 답변 구조:</strong> ① Old file의 missing, new producer explicit null, default/backfill을 분리 ② schema/file/producer version별 count ③ reader default와 table schema reconciliation ④ adoption timeline·late data·partition 분포 ⑤ expected rollout이면 정상, new writer omission이면 장애라는 판정 ⑥ reader-first rollback/backfill/replay와 관측 지표를 말한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Q3. Partial update API에서 missing/null/empty를 어떻게 모델링합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> ① KEEP/CLEAR/SET 요구사항 ② JSON key membership과 explicit null/empty 예시 ③ presence bit + nullable value 또는 tagged union ④ serializer/DTO가 tri-state를 보존하는지 ⑤ idempotency·concurrent update·audit log ⑥ database update SQL과 tests ⑦ JSON Merge Patch/field mask 같은 대안을 contract에 맞춰 평가한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제: CSV state machine</h3>
+<ol style="padding-left:22px;">
+<li>Quoted multiline CSV를 newline 기준으로 임의 분할하면 왜 위험한가?</li>
+<li><code>IN_QUOTED</code>와 <code>AFTER_QUOTE</code> 상태에서 quote의 의미를 설명하라.</li>
+<li>Unclosed quote 뒤 다음 line부터 재시작하지 말아야 하는 이유는?</li>
+</ol>
+<div style="padding:14px;background:#f7faf8;border:1px solid #d9e6df;"><strong>짧은 정답:</strong> ① Newline은 quote 밖일 때만 record boundary이며 worker는 시작 quote state를 모른다. ② IN_QUOTED의 quote는 닫기 후보, AFTER_QUOTE의 두 번째 quote는 escaped quote이고 delimiter/newline은 종료다. ③ Record 경계를 확증할 수 없어 column shift·silent loss가 생기므로 file/chunk를 quarantine한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;">
+<li>Validity bitmap에서 null string과 empty string을 어떻게 구분하는가?</li>
+<li><code>COUNT(*)</code>, <code>COUNT(col)</code>, <code>col = NULL</code>, <code>col IS NULL</code>의 차이는?</li>
+<li>Patch에서 missing/null/empty를 합치면 어떤 장애가 생기며 어떻게 모델링해야 하는가?</li>
+</ol>
+<div style="padding:14px;background:#eaf7f1;border:1px solid #bed9cc;"><strong>정답/채점 기준:</strong> ① 둘 다 data length 0일 수 있지만 null은 validity bit 0, empty는 bit 1이며 offsets만으로는 부족하다. ② <code>COUNT(*)</code>는 rows 전체, <code>COUNT(col)</code>은 non-null, equality with NULL은 UNKNOWN, <code>IS NULL</code>만 null을 찾는다. ③ Missing KEEP가 null CLEAR로 바뀌거나 empty SET가 손실된다. Presence bit + nullable value/tagged union과 golden tests가 필요하다. 문제당 3점: 정의 1, 내부 표현 1, 실무 영향/복구 1. 총 7점 이상 통과.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://www.w3.org/TR/tabular-metadata/" style="color:#126246;">W3C Metadata Vocabulary for Tabular Data</a> — CSV column의 null marker와 metadata contract를 확인한다.</li>
+<li><a href="https://arrow.apache.org/docs/format/Columnar.html" style="color:#126246;">Apache Arrow Columnar Format</a> — validity bitmap, null count, variable-length offsets의 물리 표현을 확인한다.</li>
+<li><a href="https://duckdb.org/docs/current/data/csv/overview" style="color:#126246;">DuckDB 공식 CSV Import 문서</a> — <code>nullstr</code>, <code>force_not_null</code>, <code>null_padding</code> 등 reader 설정을 확인한다.</li>
+<li><a href="https://docs.python.org/3/library/csv.html" style="color:#126246;">Python 공식 csv 문서</a> — CSV read/write가 <code>None</code>과 empty를 어떻게 다룰 수 있는지 확인한다.</li>
+</ul>
+<p style="font-size:14px;color:#53635c;">Format/library default는 domain semantics가 아니다. 사용하는 engine version과 옵션, source contract를 golden rows로 고정해 검증한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Day 10 · JSON tree, number, duplicate key</strong><br>JSON object/array tree가 byte token에서 만들어지는 과정, number precision, duplicate key의 비결정성, parser limits와 안전한 canonicalization을 다룬다.</div>
+
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>
