@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 18</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 3 / DAY 18</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">backward/forward/full compatibility</h1><div style="font-size:15px;color:#d8eee5;">Writer×reader 방향에서 rolling deploy·rollback·retention까지 · 예상 학습 60분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>호환성은 schema 두 장의 모양이 비슷한지가 아니라 <strong>어떤 writer가 만든 bytes를 어떤 reader가 읽어 어떤 의미를 얻는가</strong>의 방향성 계약이다. Backward는 새 reader가 old bytes를 읽는 것, forward는 old reader가 new bytes를 읽는 것, full은 양방향이며, 실제 안전성은 rolling deploy·rollback·저장 데이터 보존 기간 전체에서 검증해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:29%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Writer</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Logical value를 특정 schema/version으로 bytes에 기록한 producer다. 여기서는 <code>W1</code>, <code>W2</code>처럼 표시한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Reader</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Bytes를 자기 schema/version의 object와 의미로 복원하는 consumer다. <code>R1</code>, <code>R2</code>로 표시한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Backward compatible</strong></td><td style="padding:9px;border:1px solid #d9e6df;">새 reader가 old writer bytes를 안전하게 읽는다. 식으로는 <code>R_new(W_old(x))</code>가 성공하고 의미 불변식을 만족한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Forward compatible</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Old reader가 new writer bytes를 안전하게 읽는다. 식으로는 <code>R_old(W_new(x))</code>다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Full compatible</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Backward와 forward가 모두 성립한다. 무중단 혼합 배포·consumer rollback에 유리하지만 business semantics까지 자동 보장하지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Transitive</strong></td><td style="padding:9px;border:1px solid #d9e6df;">새 version을 직전 version뿐 아니라 정책 범위의 모든 역사적 version과 비교한다. 장기 보관 data와 offline client가 있으면 중요하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Version skew</strong></td><td style="padding:9px;border:1px solid #d9e6df;">동시에 실행되는 producer/consumer의 schema·binary version이 다른 상태다. 배포, cache, mobile, rollback 때문에 정상 운영 중 항상 발생한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Rolling deployment</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Instance를 한 번에 교체하지 않고 순차적으로 새 version으로 바꾸는 배포다. 일정 시간 old/new reader·writer가 섞인다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Rollback</strong></td><td style="padding:9px;border:1px solid #d9e6df;">문제 version에서 이전 binary/schema로 되돌리는 전환이다. New bytes가 이미 저장됐다면 old reader가 그것을 읽어야 하므로 forward 방향이 필요하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Wire compatibility</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Byte parser가 두 schema 사이에서 record 경계를 보존하고 값을 읽을 수 있다는 뜻이다. Business 의미·API compile·보안 호환과는 별개다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Semantic compatibility</strong></td><td style="padding:9px;border:1px solid #d9e6df;">읽힌 값이 unit, range, presence, enum, PII, 권한과 domain invariant까지 같은 의도로 동작한다는 뜻이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Golden bytes</strong></td><td style="padding:9px;border:1px solid #d9e6df;">특정 writer version이 만든 실제 serialized fixture와 기대 결과를 보존한 test artifact다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>“새 schema가 old schema와 호환된다”는 문장은 방향이 없어서 운영 판단에 쓸 수 없다. 새 consumer를 먼저 배포할 때는 <code>R2(W1)</code>이 필요하고, 새 producer를 켠 뒤 old consumer가 남아 있거나 consumer를 rollback할 때는 <code>R1(W2)</code>가 필요하다. 두 방향의 요구 시점과 실패 비용이 다르다.</p>
+<p>Registry가 adjacent schema diff를 통과시켰어도 6개월 된 object storage data, 재처리 queue, offline mobile client와 rollback binary에는 실패할 수 있다. 더구나 parser가 성공해도 새 code가 old message의 absent field를 잘못 해석하거나 old code가 새 enum 의미를 모르면 semantic incident가 난다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>오늘의 핵심 불변식:</strong> 호환성 판정에는 최소한 writer version, reader version, fixture bytes, expected logical result, runtime build와 적용 기간이 들어간다. “parse 성공”만으로 compatible이라 부르지 않는다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Schema change proposal V2</strong><br>diff + field identity + semantic contract + retention inventory</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ build W1/W2 × R1/R2 golden matrix</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Compatibility gate</strong><br>wire parse · value/presence · unknown/default · domain invariant</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ Phase A: deploy R2 while W1 remains</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Backward edge</strong><br><code>R2(W1)</code> · old stored/replayed bytes → new object</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ Phase B: canary W2 while R1 still exists</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Forward edge</strong><br><code>R1(W2)</code> · new bytes → old object / unknown handling</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ observe, expand, preserve rollback window</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ V2 steady state</strong><br>W2/R2 + historical W1 retention + rollback-ready R1</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Data path:</strong> W version의 logical value → bytes → queue/file/cache → R version의 object → domain validation → sink.<br><strong>Control path:</strong> schema policy, compatibility direction, version inventory, rollout percentage, retention horizon, runtime builds, metric threshold와 rollback pointer를 전달한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">4칸 matrix를 먼저 그린다</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;text-align:center;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Reader \ Writer</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">W1</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">W2</th></tr>
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;">R1</th><td style="padding:8px;border:1px solid #d9e6df;">Baseline<br><code>R1(W1)</code></td><td style="padding:8px;border:1px solid #d9e6df;"><strong>Forward</strong><br><code>R1(W2)</code></td></tr>
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;">R2</th><td style="padding:8px;border:1px solid #d9e6df;"><strong>Backward</strong><br><code>R2(W1)</code></td><td style="padding:8px;border:1px solid #d9e6df;">Target<br><code>R2(W2)</code></td></tr>
+</table>
+<ol style="padding-left:22px;"><li><strong>Inventory:</strong> 현재 producer/consumer, stored generations, retry TTL, client update 지연과 rollback version을 수집한다.</li><li><strong>Generate:</strong> 각 writer로 null/default/boundary/enum/unknown fixture를 만들고 bytes·schema fingerprint·expected object를 고정한다.</li><li><strong>Cross-read:</strong> 각 reader/runtime으로 다른 writer의 bytes를 읽고 parse outcome, consumed bytes, unknown/default/presence와 domain 결과를 기록한다.</li><li><strong>Readers first:</strong> R2를 먼저 배포해 W1 traffic에서 backward edge를 production shadow로 확인한다.</li><li><strong>Writer canary:</strong> W2를 일부 켜서 남은 R1과 forward edge를 관찰한다.</li><li><strong>Commit:</strong> Matrix와 metrics가 threshold를 만족하고 rollback/replay가 실제로 가능할 때 version pointer를 확정한다.</li></ol>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자와 실패 창</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:27%;">소유자</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">소유 상태·불변식·실패 창</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema registry/repo</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Immutable versions, compatibility policy·scope, field tombstone와 provenance를 소유한다. Registry pass와 실제 runtime proof를 구분한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Deployment controller</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Reader/writer rollout 순서, canary %, fleet version 분포와 rollback pointer를 소유한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Storage/queue owner</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Data generation, retention, retry/DLQ TTL, replay checkpoint와 immutable bytes를 소유한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Runtime owner</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Generated code/compiler/library build, unknown-field behavior, limits와 language-specific API semantics를 소유한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Domain owner</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Required meaning, unit/range/enum/presence, PII·authorization, reconciliation과 허용 가능한 degradation을 소유한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Backward와 forward는 시간축의 서로 다른 edge다</h3>
+<p>Readers-first 배포는 R2가 W1 bytes를 읽는 backward edge를 먼저 연다. 그 뒤 W2를 켜는 순간 R1이 남아 있으면 forward edge가 필요하다. Consumer를 함께 배포한다고 해도 queue lag, cache, retry와 rollback이 version skew를 만든다. “동시 배포”는 edge를 없애지 못한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Avro와 Protobuf의 byte mechanism은 다르다</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:25%;">관점</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Avro</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Protobuf binary</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Field identity</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer/reader record field name·alias.</td><td style="padding:8px;border:1px solid #d9e6df;">Message 안의 field number.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Read inputs</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Exact writer schema + optional reader schema.</td><td style="padding:8px;border:1px solid #d9e6df;">Tag-value bytes + reader generated schema.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Writer-only field</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer schema type으로 consume하고 reader result에서 무시.</td><td style="padding:8px;border:1px solid #d9e6df;">Wire type으로 skip하거나 runtime unknown state에 보존.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Reader-only field</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Reader default가 있으면 materialize, 없으면 resolution error.</td><td style="padding:8px;border:1px solid #d9e6df;">Wire에 tag가 없고 generated API presence/default 규칙을 적용.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>주요 위험</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Wrong writer schema, missing default, alias/type resolution.</td><td style="padding:8px;border:1px solid #d9e6df;">Number reuse, conditionally compatible type, unknown loss, presence/oneof.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Protobuf field 추가는 wire-safe여도 application-safe가 아닐 수 있다</h3>
+<p>Binary에서 새 field를 추가하면 R1은 unknown field로 처리하고 R2는 W1 bytes에서 absent 상태를 본다. 두 방향 parse는 흔히 성공한다. 그러나 R2 business logic이 email이 반드시 있어야 한다고 가정하거나, R1 proxy가 ProtoJSON을 거치며 unknown email을 잃으면 round-trip과 의미는 깨진다.</p>
+<p>공식 문서는 binary wire-safe와 conditionally wire-compatible를 구분한다. 같은 wire type이라 parse 가능한 type 변경도 truncation, UTF-8, singular/repeated last-one-wins, enum runtime 표현 때문에 값이 손실될 수 있다. Schema checker가 “compatible”이라고 해도 golden values가 필요하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Transitive 정책은 history set의 크기를 정한다</h3>
+<p>Non-transitive check가 V3↔V2와 V2↔V1을 각각 통과해도 V3↔V1이 성립한다고 일반적으로 보장되지 않는다. 중간 version에서 default·alias·reserved·type을 단계적으로 바꾸면 누적 변화가 edge를 끊을 수 있다. 검사 대상은 직전 version이 아니라 실제 retention과 deployed readers가 만든 version set이다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Compatibility는 relation이지 schema의 단일 속성이 아니다</h3>
+<p><code>Compatible(W,R,bytes,runtime,semantics)</code>처럼 여러 입력에 대한 관계로 본다. 같은 schema pair도 Java와 Python의 enum API, JSON bridge, library limit, corrupt-input policy가 다르면 결과가 다르다. 그래서 schema diff, golden byte test, deployment telemetry의 세 층이 모두 필요하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 성공 확정점은 rollback 가능성까지 포함한다</h3>
+<p>Canary parse error가 0이라고 완료가 아니다. New writer bytes가 retention에 들어간 뒤 old reader rollback이 가능한지, unknown/default/presence와 domain aggregate가 정상인지, failed generation을 어느 checkpoint부터 idempotent replay할지 확인해야 한다. Rollback binary가 new data를 읽지 못하면 code rollback만으로 복구되지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:29%;">판단</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Policy naming</strong></td><td style="padding:8px;border:1px solid #d9e6df;">BACKWARD 같은 label 옆에 반드시 <code>R_new(W_old)</code>, 비교 history, format과 runtime을 ADR에 적는다. 제품별 용어 오해를 막는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Scope</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Queue TTL·object retention·offline client SLA·rollback depth를 합쳐 비교 version set을 결정한다. “최근 1개”를 임의로 쓰지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Proof artifact</strong></td><td style="padding:8px;border:1px solid #d9e6df;">W×R matrix마다 schema fingerprint, writer bytes/checksum, runtime build, expected object·domain invariant를 CI artifact로 보존한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Rollout</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Readers first → shadow old bytes → writer canary → old reader traffic 관찰 → 확대. 방향별 gate와 rollback pointer를 분리한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Schema pair별 count, parse/reason, unknown bytes, default/presence, enum, null, range, business sum과 consumer lag를 계측한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Migration</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Rename/type/unit 변경은 새 field 추가 → dual-write → readers dual-read → backfill/reconcile → old write 중단 → reserve 순서로 수렴시킨다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Storage vs API</strong></td><td style="padding:8px;border:1px solid #d9e6df;">장기 보관 schema와 live RPC schema의 evolution 요구가 다르면 별도 message와 명시적 translation layer를 둔다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern·edge case·version 차이</h3>
+<ul style="padding-left:22px;"><li><strong>호환=true 한 줄:</strong> 방향, history, runtime, semantics가 빠졌다.</li><li><strong>Registry pass=production safe:</strong> Unit·presence·default·enum·PII·authorization을 검사하지 못한다.</li><li><strong>R1/W2만 테스트:</strong> Backward edge와 baseline/target조차 빠진다.</li><li><strong>Adjacent pass면 transitive:</strong> 누적 default·rename·type 단계가 V1↔V3 edge를 끊을 수 있다.</li><li><strong>동시 배포로 해결:</strong> Queue lag, cache, offline client와 rollback이 skew를 유지한다.</li><li><strong>Parse error 0=성공:</strong> Silent truncation, unknown loss, default 증가와 domain aggregate 오염을 놓친다.</li><li><strong>Protobuf field 추가는 무조건 full:</strong> Binary wire에서는 안전해도 required business logic·JSON bridge·oneof가 깨질 수 있다.</li><li><strong>Avro default가 optional:</strong> Default는 reader가 old bytes를 읽을 때 materialize하며 writer encode 의무와 별개다.</li><li><strong>Rollback=old binary 재배포:</strong> 이미 생성된 W2 bytes를 R1이 읽을 수 있는지 먼저 확인해야 한다.</li><li><strong>모든 언어 runtime 동일:</strong> Enum, unknown field, presence, size limit과 generated API가 다를 수 있다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">배포 뒤 특정 version pair만 parse 실패, rollback 후 consumer crash, unknown/default/null 급증, enum·sum·currency·권한 값 변화, replay에서만 실패, JSON proxy 뒤 새 field 소실, old mobile client 오류.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Immutable payload/checksum, W/R schema fingerprint와 runtime build, exact pair traffic count, failure offset/reason, unknown bytes, default/presence/enum counters, producer/consumer fleet version, queue lag·retention generation, sink/checkpoint, before/after domain aggregates.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">검사 방향 반대, adjacent-only gap, field number/name/type reuse, missing Avro reader default, wrong writer schema, Protobuf unknown loss/oneof/presence 변화, stale generated code, conditionally compatible truncation, rollout 순서 위반, partial/corrupt frame.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Writer 확대와 affected consumer checkpoint를 멈춘다. Version pair별 traffic을 격리하고 payload·schema·runtime을 보존해 4칸 matrix를 production build로 offline 재현한다. Parse 성공 값도 domain invariant와 비교한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good W/R pair로 routing하고 incompatible W2 generation을 quarantine한다. 필요하면 tolerant R2 reader를 먼저 복구 배포한다. Safe checkpoint부터 idempotent replay하고 pair count·unknown/default·business aggregate를 reconcile한 뒤 pointer를 전환한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Latest schema fallback, raw bytes 수정, failed row skip 후 checkpoint, unknown/default를 임의 값으로 치환, registry policy를 즉석 완화, version label 없이 전체 traffic 합산, 증거 없는 cache clear, idempotency 없는 replay, new bytes 존재 확인 없이 old binary만 rollback하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: W1/W2 × R1/R2 compatibility matrix</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리만으로 Protobuf-like tag stream을 만들고, field 추가가 두 방향에서 parse되는 이유와 wire compatibility가 business compatibility를 보장하지 않는 이유를 관찰한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package나 <code>protoc</code>는 필요 없다. 이 코드는 교육용 bounded scanner이며 production runtime 대체가 아니다.</p>
+<p><strong>실행 전 예측:</strong> V2에 <code>email=3</code>을 추가했을 때 <code>R2(W1)</code>의 email presence, <code>R1(W2)</code>의 unknown field를 적는다. “email은 모든 신규 logic에서 필수”라는 domain rule을 켜면 어느 칸이 실패할지 예상한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.1 네 칸을 bytes로 실행</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def varint(n):
+    out = bytearray()
+    while n &gt; 0x7f: out.append((n &amp; 0x7f) | 0x80); n &gt;&gt;= 7
+    out.append(n); return bytes(out)
+
+def field(no, wire, value):
+    key = varint((no &lt;&lt; 3) | wire)
+    if wire == 0: return key + varint(value)
+    if wire == 2:
+        raw = value.encode(); return key + varint(len(raw)) + raw
+    raise ValueError("lab supports wire 0/2")
+
+def readv(buf, p):
+    n = 0
+    for i in range(10):
+        if p &gt;= len(buf): raise ValueError("TRUNCATED_VARINT")
+        b = buf[p]; p += 1; n |= (b &amp; 0x7f) &lt;&lt; (7*i)
+        if b &lt; 128: return n, p
+    raise ValueError("OVERLONG_VARINT")
+
+def parse(buf, schema, max_len=128):
+    p, obj, present, unknown = 0, {}, set(), []
+    while p &lt; len(buf):
+        key, p = readv(buf, p); no, wire = key &gt;&gt; 3, key &amp; 7
+        if no == 0 or wire not in (0, 2): raise ValueError("BAD_TAG")
+        if wire == 0: value, p = readv(buf, p)
+        else:
+            size, p = readv(buf, p)
+            if size &gt; max_len or size &gt; len(buf)-p: raise ValueError("BAD_LEN")
+            value, p = buf[p:p+size].decode(), p+size
+        spec = schema.get(no)
+        if spec is None: unknown.append((no, wire, value)); continue
+        name, expected, default = spec
+        if wire != expected: raise ValueError(f"WIRE_MISMATCH field={no}")
+        obj[name] = value; present.add(name)
+    for name, wire, default in schema.values(): obj.setdefault(name, default)
+    return obj, present, unknown
+
+V1 = {1:("id",0,0), 2:("name",2,"")}
+V2 = {1:("id",0,0), 2:("name",2,""), 3:("email",2,"")}
+W1 = field(1,0,7) + field(2,2,"kim")
+W2 = W1 + field(3,2,"kim@example.com")
+
+for rname, schema in [("R1",V1),("R2",V2)]:
+  for wname, raw in [("W1",W1),("W2",W2)]:
+    obj, present, unknown = parse(raw, schema)
+    business_ok = not (rname == "R2" and "email" not in present)
+    print(f"{rname}({wname})", obj, "present=", sorted(present),
+          "unknown=", unknown, "business_ok=", business_ok)
+print("W1=", W1.hex(" ")); print("W2=", W2.hex(" "))
+PY</code></div>
+<p><strong>예상 관찰:</strong> 네 칸 모두 wire parse는 성공한다. R2(W1)은 email이 default empty지만 presence에는 없고 business rule은 실패한다. R1(W2)는 field 3을 unknown으로 분리한다. 즉 field 추가는 binary 양방향에 안전할 수 있지만 application full compatibility는 별도 판정이다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 실패 주입: 번호/type 재사용과 adjacent-only 함정</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def v(n):
+    o=bytearray()
+    while n&gt;127:o.append((n&amp;127)|128);n&gt;&gt;=7
+    o.append(n);return bytes(o)
+def rv(b,p=0):
+    n=0
+    for i in range(10):
+        if p&gt;=len(b):raise ValueError("EOF")
+        x=b[p];p+=1;n|=(x&amp;127)&lt;&lt;(7*i)
+        if x&lt;128:return n,p
+    raise ValueError("OVERLONG")
+def one(raw, expected_wire):
+    key,p=rv(raw); no,wire=key&gt;&gt;3,key&amp;7
+    if no!=2 or wire!=expected_wire: raise ValueError(f"WIRE_MISMATCH {wire}!={expected_wire}")
+    if wire==0:return rv(raw,p)[0]
+    size,p=rv(raw,p)
+    if size&gt;len(raw)-p:raise ValueError("BAD_LEN")
+    return raw[p:p+size].decode()
+
+old_name = v((2&lt;&lt;3)|2) + v(3) + b"kim"      # V1: string name = 2
+new_admin = v((2&lt;&lt;3)|0) + v(1)               # V3: bool is_admin = 2 (금지)
+for label, raw, expected in [
+  ("R3(W1)", old_name, 0), ("R1(W3)", new_admin, 2)]:
+    try: print(label, one(raw, expected))
+    except Exception as e: print(label, "REJECT", e)
+
+# Adjacent relation은 자동으로 transitive하지 않음을 작은 graph로 확인한다.
+edges={"V2": {"V1"}, "V3": {"V2"}}
+print("adjacent checks pass=", "V1" in edges["V2"] and "V2" in edges["V3"])
+print("V3 directly checked against V1=", "V1" in edges["V3"])
+PY</code></div>
+<p><strong>예상 관찰:</strong> 번호 2의 wire type을 바꾼 두 교차 방향은 모두 mismatch로 거부된다. Adjacent edge 두 개가 있어도 V3↔V1 direct proof는 없다. 실제 CI에서는 history set의 모든 golden bytes를 각 supported reader로 실행해야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 자주 나는 오류와 해결·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>Default empty를 present로 판단:</strong> Object value와 wire presence를 따로 기록한다.</li><li><strong>Unknown을 실패로 처리:</strong> Format/runtime policy에 맞게 skip·preserve하고 metric으로 관찰한다.</li><li><strong>한 runtime만 실행:</strong> 실제 producer/consumer 언어·compiler/library 조합을 matrix dimension에 추가한다.</li><li><strong>Business assertion 생략:</strong> Parse 결과뿐 아니라 unit/range/enum/PII/권한·aggregate를 fixture 기대값에 넣는다.</li></ul>
+<p><strong>Cleanup:</strong> 위 명령은 파일·package·container를 만들지 않는다. 실제 production bytes에는 PII가 있을 수 있으므로 terminal·CI log에 붙여 넣지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Backward/forward 이름보다 reader와 writer 방향식을 먼저 쓴다.</li><li>Baseline R1(W1)과 target R2(W2)도 검증해야 fixture 자체 오류를 찾을 수 있다.</li><li>Full compatibility는 transitive compatibility와 다르다.</li><li>Schema pair가 같아도 runtime·bridge·limit이 다르면 결과가 달라진다.</li><li>Protobuf unknown field가 JSON 또는 field-by-field copy에서 사라질 수 있다.</li><li>Avro reader default는 old bytes에 쓰여 있지 않으며 read-time 결과다.</li><li>Wire-safe change도 generated API compile과 exhaustive enum switch를 깨뜨릴 수 있다.</li><li>Stored data retention과 retry TTL 중 더 긴 기간이 history scope를 결정할 수 있다.</li><li>Rollback binary가 new bytes를 읽지 못하면 단순 code rollback은 복구가 아니다.</li><li>호환성 완료 시점은 canary뿐 아니라 replay·reconciliation 성공까지 포함한다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Backward·forward·full compatibility를 rolling deploy 흐름으로 설명하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> W1/W2와 R1/R2를 정의한다 → 4칸 matrix와 두 방향식을 그린다 → readers-first에서 R2(W1), writer canary에서 R1(W2)가 필요한 이유를 말한다 → queue/retention/offline/rollback failure window를 포함한다 → pair별 metrics·golden bytes·idempotent rollback/replay로 성공 조건을 제시한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Registry에서 FULL_TRANSITIVE를 켜면 왜 충분하지 않을 수 있습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Registry의 schema-level relation과 scope를 확인한다 → runtime·format(Avro/Protobuf/JSON) byte mechanism을 구분한다 → default/presence/enum/unit/PII/unknown loss를 든다 → 실제 retention version set과 compiler/library matrix를 수치로 가정한다 → CI golden matrix, canary telemetry와 domain reconciliation을 추가한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. 1년 보관 이벤트 schema를 무중단으로 변경하는 절차를 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Producer/consumer·replay SLA와 비용을 묻는다 → 모든 retained writer generation과 rollback readers를 inventory한다 → 새 field/dual-write/read migration을 설계한다 → readers-first, shadow old data, writer canary, fleet 확대 순서를 말한다 → quarantine capacity, checkpoint, rollback pointer, backfill/reconcile와 최종 tombstone을 방어한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Protobuf tag에서 field number와 wire type을 꺼내는 식은?</li><li>Unknown LEN field를 안전하게 skip하는 순서는?</li><li>Field number를 같은 wire type의 다른 의미로 재사용하면 왜 더 위험할 수 있는가?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Readers-first와 writers-first 각 단계에서 필요한 compatibility 방향식을 쓰라.</li><li>Protobuf 새 field 추가가 wire에서는 양방향 parse되는데 business에서는 backward 실패할 수 있는 예를 들어라.</li><li>Adjacent FULL과 FULL_TRANSITIVE의 증거 범위 차이, 그리고 retention이 policy 선택에 미치는 영향을 설명하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Encode는 <code>(field_number &lt;&lt; 3) | wire_type</code>. Decode는 <code>field=tag&gt;&gt;3</code>, <code>wire=tag&amp;7</code>이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Bounded tag → valid field/wire → bounded length → app limit/overflow → frame remaining → bounded slice와 cursor commit 순서다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Parser가 성공해 old value를 bool/enum/권한 같은 새 의미로 조용히 오해석할 수 있기 때문이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Readers-first는 <code>R2(W1)</code> backward, W2 canary 중 old reader가 남으면 <code>R1(W2)</code> forward가 필요하다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">R2가 W1의 absent email을 default empty로 읽지만 새 logic이 email을 필수로 요구하면 parse 성공 뒤 domain 실패다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Adjacent는 Vn↔Vn-1, transitive는 supported history 전체와 직접 증명한다. 1년 data를 replay하면 1년의 writer generations를 scope에 포함해야 한다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. 방향식, byte mechanism, version skew, transitive scope, semantic metric과 rollback/replay를 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://protobuf.dev/programming-guides/proto3/#updating" style="color:#126246;">Protocol Buffers Proto3 Guide — Updating A Message Type</a>: Binary wire-safe·unsafe·conditionally compatible 변경과 unknown-field 보존/손실을 확인한다.</li><li><a href="https://protobuf.dev/best-practices/dos-donts/" style="color:#126246;">Protocol Buffers Best Practices</a>: 동시 배포 가정 금지, tag reserve, type/default 변경 회피와 storage/API 분리를 확인한다.</li><li><a href="https://protobuf.dev/programming-guides/field_presence/" style="color:#126246;">Protocol Buffers Field Presence</a>: Wire의 present tag-value와 generated API default/presence 차이를 확인한다.</li><li><a href="https://avro.apache.org/docs/current/specification/#schema-resolution" style="color:#126246;">Apache Avro Specification — Schema Resolution</a>: Writer-only skip, reader default, promotion과 resolution error의 방향을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">BACKWARD/FORWARD/FULL 같은 registry policy 이름과 비교 범위는 제품 설정에서 반드시 다시 확인한다. 이 자료는 혼동을 막기 위해 reader(writer(bytes)) 방향식을 기준으로 사용한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 3 · Day 19 — default, optional, unknown field</strong><br>Value=0과 absent, explicit presence와 implicit presence, reader default와 unknown-field round-trip을 byte·API·business 세 층으로 분리한다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · direction first, matrix proof, rollback ready</td></tr>
+</table></td></tr></table></body></html>
