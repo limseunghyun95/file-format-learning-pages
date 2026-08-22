@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 19</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 3 / DAY 19</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">default, optional, unknown field</h1><div style="font-size:15px;color:#d8eee5;">Byte presence에서 API·business semantics까지 · 예상 학습 60분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br><strong>값이 0인 것, field가 wire에 없는 것, 0으로 명시 설정된 것, reader가 모르는 field</strong>는 서로 다른 상태다. 이 경계를 보존하지 않으면 parser는 성공해도 PATCH가 적용되지 않고, old proxy가 새 field를 지우며, 같은 Avro bytes가 reader default 변경만으로 다른 business value가 될 수 있다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:29%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Field presence</strong></td><td style="padding:9px;border:1px solid #d9e6df;">“상자 안의 값”과 별도로 “상자가 도착했는가”를 추적하는 상태다. Wire presence, generated API presence, business presence를 구분해야 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Default value</strong></td><td style="padding:9px;border:1px solid #d9e6df;">값이 없을 때 API 또는 reader가 보여 주는 기본값이다. Protobuf scalar의 API default와 Avro reader default는 작동 시점·byte 규칙이 다르다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Implicit presence</strong></td><td style="padding:9px;border:1px solid #d9e6df;">API가 값만 저장하고 “설정됨” bit를 따로 보존하지 않는 규칙이다. Proto3의 <code>optional</code> 없는 기본 scalar가 대표적이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Explicit presence</strong></td><td style="padding:9px;border:1px solid #d9e6df;">값과 함께 set/unset 상태를 추적한다. Proto3 <code>optional</code>, singular message, <code>oneof</code>가 대표적이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Unknown field</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Wire 형식은 올바르지만 현재 schema가 field number를 모르는 tag-value다. “잘못된 field”가 아니라 미래/과거 schema의 opaque payload일 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Round-trip</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Parse한 뒤 다시 serialize해 정보가 보존되는 왕복이다. Byte 배열이 완전히 같을 필요는 없지만 알려진 값·presence·unknown 의미가 유지돼야 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>FieldMask</strong></td><td style="padding:9px;border:1px solid #d9e6df;">PATCH에서 어떤 경로를 실제로 변경할지 별도로 나열하는 목록이다. Presence가 없는 field를 0으로 지우려 할 때 “0 적용”과 “변경 없음”을 구분한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Merge</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Source message의 present field를 target에 덮는 연산이다. Implicit default는 skip되므로 단순 merge로 0을 적용하지 못할 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Null</strong></td><td style="padding:9px;border:1px solid #d9e6df;">“값이 없음”을 나타내는 명시적 logical value다. Absent와 다르며 Avro에서는 union에 <code>null</code>이 있어야 표현된다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Reader default</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Avro reader schema에만 있는 field를 old writer bytes에서 읽을 때 materialize하는 값이다. 원본 bytes에는 쓰여 있지 않다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Opaque preservation</strong></td><td style="padding:9px;border:1px solid #d9e6df;">내용을 이해하지 못해도 unknown raw field를 보존하고 재직렬화하는 전략이다. Old relay가 new producer와 new consumer 사이에 있을 때 중요하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Semantic default</strong></td><td style="padding:9px;border:1px solid #d9e6df;">“통화 미지정이면 KRW” 같은 업무 정책이다. Serialization/API default와 우연히 같더라도 별도 versioned contract로 관리해야 한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>결제 한도를 <code>100</code>에서 <code>0</code>으로 지우는 PATCH를 생각하자. API가 implicit presence라면 <code>limit=0</code>은 serialize에서 사라지고 merge에서도 skip될 수 있다. Server는 이를 “변경 없음”으로 받아 기존 100을 유지한다. HTTP 200과 protobuf parse 성공에도 업무 결과는 틀렸다.</p>
+<p>또한 new producer가 field 3을 추가하고 old relay가 message를 읽어 JSON으로 바꾼 뒤 다시 binary로 만들면, old relay가 몰랐던 field 3은 사라질 수 있다. 장애는 relay가 아니라 downstream의 “신규 field missing”으로 늦게 나타난다. 따라서 unknown 보존 여부는 data path 전체의 속성이다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>오늘의 핵심 불변식:</strong> <code>absent</code>, <code>explicit default</code>, <code>null</code>, <code>unknown</code>을 한 상태로 접지 않는다. 변환 단계마다 어느 상태를 입력받고, 무엇을 보존하며, 어디서 business default를 적용했는지 증거를 남긴다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Caller intent</strong><br>unchanged · set 0 · clear · set value를 구분</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ generated API + presence / FieldMask</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Serializer</strong><br>present tag-value만 wire에 기록 · implicit default는 생략</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ binary bytes: known field + future unknown field</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Old relay / storage</strong><br>known object + opaque unknown set · binary round-trip</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ 위험 창: JSON bridge 또는 field-by-field copy</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ New reader</strong><br>value + presence + unknown → schema resolution/default</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ domain validation and apply</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Business state</strong><br>no-op / clear / explicit 0 / inherited default를 확정</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Data path:</strong> caller intent → API state → tag-value bytes → relay/storage → reader object → domain command → database.<br><strong>Control path:</strong> schema syntax·field number·presence discipline·reader default version·FieldMask·unknown policy·runtime build·rollback pointer를 전달한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">상태의 소유자와 성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">층</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">소유 상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">성공 조건</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Wire</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Present tag-value, raw unknown, frame boundary</td><td style="padding:8px;border:1px solid #d9e6df;">Bounded parse와 필요한 opaque bytes 보존</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Generated API</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Value, has/clear state, unknown set</td><td style="padding:8px;border:1px solid #d9e6df;">Intent를 표현하고 왕복 후 상태 유지</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema resolver</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer/reader schema, default, alias</td><td style="padding:8px;border:1px solid #d9e6df;">Exact writer bytes를 소비하고 versioned 결과 구성</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Domain</strong></td><td style="padding:8px;border:1px solid #d9e6df;">No-op/clear/set 의미와 invariant</td><td style="padding:8px;border:1px solid #d9e6df;">DB commit 뒤 요청 intent와 결과 reconcile</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Wire에는 “없음” byte가 없다</h3>
+<p>Protobuf binary는 <code>tag=(field_number&lt;&lt;3)|wire_type</code>와 payload의 연속이다. Stream에 tag가 보이면 present이며, 보이지 않으면 그 field에 대한 정보가 없다. “명시적으로 unset”이라는 별도 byte는 없다. 따라서 absence를 구분하려면 API가 presence bit를 추적하거나 <code>oneof</code>, wrapper, FieldMask 같은 protocol을 설계해야 한다.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Caller/API 상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Implicit int32</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">optional int32</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Unset</td><td style="padding:8px;border:1px solid #d9e6df;">Getter 0, bytes 없음</td><td style="padding:8px;border:1px solid #d9e6df;">Getter 0, <code>has=false</code>, bytes 없음</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Set 0</td><td style="padding:8px;border:1px solid #d9e6df;">Getter 0, bytes 없음</td><td style="padding:8px;border:1px solid #d9e6df;">Getter 0, <code>has=true</code>, bytes <code>08 00</code></td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Set 7</td><td style="padding:8px;border:1px solid #d9e6df;">Getter 7, bytes <code>08 07</code></td><td style="padding:8px;border:1px solid #d9e6df;">Getter 7, <code>has=true</code>, bytes <code>08 07</code></td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Merge와 PATCH의 함정</h3>
+<p>Implicit presence에서 default는 serialization뿐 아니라 merge-from에서도 빠진다. <code>source.limit=0</code>을 target에 merge해도 target의 100이 남을 수 있다. PATCH는 body만 믿지 말고 <code>FieldMask(paths=["limit"])</code>나 명시적 command를 함께 보내 “0으로 변경”을 표현한다. 반대로 field가 mask에 없으면 body에 값이 있어도 변경하지 않는다는 우선순위를 문서화한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Unknown field는 forward compatibility buffer다</h3>
+<p>Old parser는 모르는 tag의 wire type을 이용해 payload 경계를 건너뛰고 unknown set에 보관할 수 있다. 같은 message object를 binary로 재직렬화하면 unknown도 다시 나간다. 하지만 field-by-field로 새 object를 만들거나 ProtoJSON을 거치면 unknown이 유실될 수 있다. Copy API와 binary pass-through를 쓰고, relay에서 unknown byte count와 round-trip test를 운영 지표로 둔다.</p>
+<p>Unknown은 schema 검증을 우회하는 비밀 저장소가 아니다. Type과 의미를 모으므로 business validation, PII 분류, canonical hash를 적용하기 어렵다. 장기 보관·보안 경계에서는 허용 크기, nesting, field count와 retention을 제한한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Avro default는 reader가 실행한다</h3>
+<p>Avro record는 writer schema 순서로 모든 field value를 encode한다. 값이 default와 같아도 field는 encode되며, default가 있다고 writer 입력을 생략할 수 있는 것이 아니다. Reader schema에만 field가 있고 writer schema에 없다면 그때 reader default가 materialize된다. Reader default가 없으면 resolution error다.</p>
+<div style="padding:14px;background:#eef6ff;border:1px solid #bfd5eb;margin:14px 0;"><strong>같은 bytes, 다른 결과:</strong> W1 bytes에 <code>currency</code>가 없다. R2 default가 <code>KRW</code>면 KRW, R3 default가 <code>USD</code>면 USD가 된다. Bytes는 변하지 않았지만 reader policy가 의미를 바꾼다. 따라서 default 변경도 data migration처럼 version·replay 영향과 rollback을 검토한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Null·absent·default·unknown의 네 상태</h3>
+<ul style="padding-left:22px;"><li><strong>Absent:</strong> wire에 field가 없고 API가 unset을 추적할 수도, 못 할 수도 있다.</li><li><strong>Explicit default:</strong> 값은 0/empty지만 optional API에서는 present다.</li><li><strong>Null:</strong> Schema가 허용한 명시적 logical value다. “안 보냄”과 동일시하지 않는다.</li><li><strong>Unknown:</strong> Wire에는 존재하지만 현재 reader가 의미를 모른다. Absent의 반대편에 가깝다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:30%;">판단</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Best practice와 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Presence가 의미인가?</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Unset과 zero/empty가 다르면 proto3 basic field에 explicit presence를 쓰고 generated <code>has/clear</code> API를 사용한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>PATCH인가?</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Full replacement와 partial update message를 분리하고 FieldMask 또는 command enum으로 no-op/set/clear를 명시한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Relay가 있는가?</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Binary message-oriented copy를 쓰고 unknown-preservation contract test를 old/new runtime마다 실행한다. JSON bridge는 schema evolution 경계로 취급한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Avro field 추가?</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Reader default가 old record에 실제로 어떤 업무 값을 만들지 검토한다. Writer는 새 schema의 모든 field를 encode하도록 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Default 변경?</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Retained generation을 새 reader로 replay해 aggregate 차이를 측정하고 reader version을 결과 metadata에 기록한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Unknown 허용?</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Size/depth/count budget과 telemetry를 둔다. Security boundary에서는 typed validation 전까지 sink 적용을 금지한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>완료 판정?</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Parse rate뿐 아니라 presence distribution, unknown bytes, PATCH intent/result, replay aggregate와 rollback reader까지 확인한다.</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Anti-pattern·edge case·runtime 차이</h3>
+<ul style="padding-left:22px;"><li><strong>Getter가 0이면 unset:</strong> Implicit API에서는 명시 0과 unset을 구분할 증거가 없다.</li><li><strong>Default가 optional을 만든다:</strong> Avro default는 encode-time optional이 아니고, Protobuf API default도 nullability가 아니다.</li><li><strong>Unknown은 old reader가 무조건 보존:</strong> Binary message 왕복은 가능해도 JSON·field-by-field copy·일부 bridge에서 사라진다.</li><li><strong>Unknown을 error로 전부 거부:</strong> Forward compatibility를 끊는다. 외부 security boundary와 내부 compatible relay의 정책을 분리한다.</li><li><strong>Unknown을 무제한 허용:</strong> Memory·CPU amplification과 숨은 PII 보관 위험이 생긴다.</li><li><strong>Default 값을 바꿔도 bytes는 같으니 안전:</strong> Avro old bytes의 read-time business result가 바뀐다.</li><li><strong>Empty list와 absent list 구분:</strong> Protobuf repeated/map은 일반적으로 explicit presence를 추적하지 않는다.</li><li><strong>Message field도 scalar처럼 implicit:</strong> Singular message는 presence를 추적한다. Field 종류별 표를 확인한다.</li><li><strong>Enum UNKNOWN이면 모든 미래 값 안전:</strong> 언어/runtime의 unknown enum API와 exhaustive switch 동작을 matrix로 확인한다.</li><li><strong>Binary equality로 round-trip 검증:</strong> Protobuf field order는 canonical하지 않을 수 있으므로 semantic equality와 unknown set 보존을 본다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">PATCH로 0/empty를 보냈는데 기존 값 유지, old relay 이후 신규 field 소실, replay에서 default 분포 급변, unknown byte count 급락/폭증, parse 성공인데 권한·통화·한도 aggregate 변화.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Immutable input/output bytes와 checksum, writer/reader schema fingerprint, runtime/compiler build, field mask, has/clear state, unknown field number·wire type·size, JSON bridge 여부, default materialization count, request intent와 DB before/after, checkpoint.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Implicit default가 serialize/merge에서 skip, mask 누락, JSON·manual copy가 unknown 제거, wrong reader default, Avro writer field 누락, schema fingerprint mismatch, oneof last-wins, stale generated code, unknown limit 초과, semantic default 변경.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Affected writer 확대와 checkpoint 진행을 멈춘다. Payload·schema·mask·runtime을 보존하고 binary direct path와 bridge path를 나눠 offline round-trip한다. Value뿐 아니라 presence·unknown·DB 결과를 비교한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good reader/default/bridge로 routing하고 손실 generation을 quarantine한다. Unknown을 보존하는 binary relay 또는 explicit presence reader를 먼저 배포한 뒤 safe checkpoint에서 idempotent replay한다. Intent/result와 aggregate를 reconcile하고 pointer를 전환한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Missing을 임의의 0/null로 채우기, latest schema fallback, raw bytes 수정, JSON 재변환 반복, unknown 전부 삭제, mask 없이 재전송, failed row skip 후 checkpoint, idempotency 없는 replay, 증거 보존 전 cache clear를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: presence·unknown·reader default를 byte로 증명</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리만으로 implicit/explicit 0의 byte 차이, unknown field 보존/유실, Avro-like reader default의 read-time 동작을 재현한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package나 <code>protoc</code>는 필요 없다. 교육용 model이며 production runtime을 대체하지 않는다.</p>
+<p><strong>실행 전 예측:</strong> Implicit 0과 unset의 hex, explicit 0의 hex, old proxy가 unknown field 3을 field-by-field copy할 때의 결과, 같은 old record를 KRW/USD default로 읽은 결과를 먼저 적는다.</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def varint(n):
+    out = bytearray()
+    while n &gt; 0x7f:
+        out.append((n &amp; 0x7f) | 0x80); n &gt;&gt;= 7
+    out.append(n); return bytes(out)
+
+def fvar(no, value):
+    return varint((no &lt;&lt; 3) | 0) + varint(value)
+
+def fstr(no, value):
+    raw = value.encode()
+    return varint((no &lt;&lt; 3) | 2) + varint(len(raw)) + raw
+
+def readv(buf, p):
+    n = 0
+    for i in range(10):
+        if p &gt;= len(buf): raise ValueError("TRUNCATED_VARINT")
+        b = buf[p]; p += 1; n |= (b &amp; 0x7f) &lt;&lt; (7*i)
+        if b &lt; 128: return n, p
+    raise ValueError("OVERLONG_VARINT")
+
+def parse(buf, known, max_len=128):
+    p, values, present, unknown = 0, {}, set(), []
+    while p &lt; len(buf):
+        start = p; key, p = readv(buf, p)
+        no, wire = key &gt;&gt; 3, key &amp; 7
+        if no == 0 or wire not in (0, 2): raise ValueError("BAD_TAG")
+        if wire == 0: value, p = readv(buf, p)
+        else:
+            size, p = readv(buf, p)
+            if size &gt; max_len or size &gt; len(buf)-p: raise ValueError("BAD_LEN")
+            value, p = buf[p:p+size].decode(), p+size
+        raw = buf[start:p]
+        if no in known:
+            values[known[no]] = value; present.add(known[no])
+        else: unknown.append((no, wire, value, raw))
+    return values, present, unknown
+
+implicit_unset = b""
+implicit_zero = b""          # API value 0은 default라 생략
+explicit_unset = b""
+explicit_zero = fvar(1, 0)   # optional field가 present면 0도 기록
+for name, raw in [("implicit_unset", implicit_unset),
+                  ("implicit_zero", implicit_zero),
+                  ("explicit_unset", explicit_unset),
+                  ("explicit_zero", explicit_zero)]:
+    value, present, unknown = parse(raw, {1:"limit"})
+    print(name, "hex=", raw.hex(" ") or "&lt;empty&gt;",
+          "getter=", value.get("limit", 0), "has=", "limit" in present)
+
+new_bytes = fvar(1, 7) + fstr(3, "future")
+known, present, unknown = parse(new_bytes, {1:"id"})
+binary_proxy = fvar(1, known["id"]) + b"".join(x[3] for x in unknown)
+manual_copy = fvar(1, known["id"])
+print("new=         ", new_bytes.hex(" "))
+print("binary_proxy=", binary_proxy.hex(" "), "unknown_preserved=", binary_proxy == new_bytes)
+print("manual_copy= ", manual_copy.hex(" "), "unknown_lost=", manual_copy != new_bytes)
+
+def avro_like_resolve(writer_record, reader_fields):
+    out = {}
+    for name, spec in reader_fields.items():
+        if name in writer_record: out[name] = writer_record[name]
+        elif "default" in spec: out[name] = spec["default"]
+        else: raise ValueError("NO_DEFAULT:" + name)
+    return out
+
+old = {"amount": 1000}
+for default in ("KRW", "USD"):
+    r = {"amount": {}, "currency": {"default": default}}
+    print("same_old_record reader_default=", default, "-&gt;", avro_like_resolve(old, r))
+try:
+    avro_like_resolve(old, {"amount": {}, "currency": {}})
+except Exception as e: print("missing_without_default=", e)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Implicit unset과 implicit zero는 모두 empty bytes·getter 0이라 구분되지 않는다. Explicit zero만 <code>08 00</code>과 <code>has=true</code>다. Binary proxy는 unknown field 3 raw bytes를 보존하지만 manual copy는 잃는다. 같은 old record도 reader default에 따라 통화가 달라진다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 실패 주입: PATCH와 corrupt unknown</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def apply_patch(current, body, mask):
+    result = dict(current)
+    for path in mask:
+        if path not in body: raise ValueError("MASK_WITHOUT_VALUE:" + path)
+        result[path] = body[path]
+    return result
+
+current = {"limit": 100}
+print("body-only implicit merge -&gt;", current)  # 0이 wire에서 빠졌다고 가정
+print("body+mask explicit set 0 -&gt;", apply_patch(current, {"limit":0}, ["limit"]))
+
+# field 3, LEN=10이라고 선언했지만 payload는 2 bytes뿐인 corrupt unknown
+bad = bytes.fromhex("1a 0a 6f 6b")
+size, remaining = bad[1], len(bad)-2
+print("unknown_length=", size, "remaining=", remaining)
+if size &gt; remaining: print("REJECT BAD_LEN before cursor commit")
+PY</code></div>
+<p><strong>안전 관찰:</strong> Presence 없는 body만으로는 0 적용 intent가 사라진다. Mask를 함께 쓰면 0을 명시 적용한다. Unknown이라고 무조건 skip하지 말고 length가 frame remaining과 budget 안에 있는지 검사한 뒤 cursor를 commit한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 자주 나는 오류와 해결·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>HTML에서 <code>&lt;&lt;</code>가 깨짐:</strong> 코드의 특수문자를 escape한 원문으로 실행한다.</li><li><strong>Byte equality만 실패:</strong> Field order가 달라질 수 있으니 known values, presence, unknown raw set을 함께 비교한다.</li><li><strong>Default를 writer 입력에 자동 삽입:</strong> Avro writer contract와 reader resolution simulation을 분리한다.</li><li><strong>Unknown payload log 노출:</strong> 운영에서는 field number·wire type·size·hash만 기본 기록하고 raw PII는 보호 저장소로 격리한다.</li></ul>
+<p><strong>Cleanup:</strong> 두 명령은 파일·package·container를 만들지 않는다. 실제 production payload는 terminal과 CI log에 붙여 넣지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Wire absence와 API default getter를 같은 증거로 보지 않는다.</li><li>Explicit 0을 preserve하려면 value뿐 아니라 presence를 테스트한다.</li><li>PATCH body와 FieldMask의 충돌 우선순위를 정한다.</li><li>Unknown 보존은 개별 parser가 아니라 end-to-end path의 속성이다.</li><li>JSON gateway를 단순 표현 변환이 아니라 compatibility boundary로 본다.</li><li>Avro default는 old bytes를 읽을 때만 쓰며 writer field 생략 허가가 아니다.</li><li>Reader default 변경은 historical replay 결과를 바꾼다.</li><li>Null은 union/schema가 허용한 value이고 absent와 다르다.</li><li>Repeated/map empty와 absent는 일반적으로 presence로 구분되지 않는다.</li><li>Round-trip 성공 기준에 unknown·business intent·DB 결과를 포함한다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Proto3에서 <code>int32 limit=1</code>과 <code>optional int32 limit=1</code>을 PATCH API 관점에서 비교하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Wire는 present tag-value만 가진다고 정의한다 → unset/set 0/set 7의 bytes와 API has state를 그린다 → implicit merge가 0을 skip하는 실패를 설명한다 → FieldMask·explicit presence·command message 대안을 비교한다 → rollout, old client, metrics와 rollback까지 말한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Old proxy가 new field를 모를 때 forward compatibility를 어떻게 보장합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Old parser의 bounded unknown skip과 opaque set을 설명한다 → binary message-oriented copy와 JSON/manual copy를 대비한다 → max size·PII·canonical hash trade-off를 짚는다 → old/new runtime golden round-trip과 unknown byte telemetry를 제시한다 → 손실 generation quarantine/replay 복구를 방어한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Avro reader default를 KRW에서 USD로 바꾸는 변경을 리뷰하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Default는 writer omission이 아니라 missing writer field의 read-time resolution임을 밝힌다 → 보관 데이터량·writer generations·replay SLA를 수치로 묻는다 → same bytes/different reader result를 보인다 → aggregate shadow read와 versioned metadata를 설계한다 → dual read, migration, rollback pointer와 reconciliation을 제안한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Backward와 forward compatibility를 <code>R(W)</code> 식으로 쓰라.</li><li>FULL과 FULL_TRANSITIVE가 비교하는 history 범위는 어떻게 다른가?</li><li>Registry parse 호환 통과가 business compatibility를 보장하지 않는 이유 두 가지는?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Implicit unset, implicit 0, explicit unset, explicit 0의 getter·presence·wire bytes를 비교하라.</li><li>Unknown field가 binary relay에서는 보존되고 JSON/manual copy에서 유실될 수 있는 이유는?</li><li>Avro reader default와 Protobuf scalar default의 적용 시점·encode 규칙 차이는?</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Backward는 <code>R_new(W_old)</code>, forward는 <code>R_old(W_new)</code>다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">FULL은 보통 adjacent 양방향, FULL_TRANSITIVE는 정책 범위의 모든 historical version과 양방향을 직접 비교한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Unit·presence·default·enum·PII·권한 의미와 runtime/JSON bridge/API compile은 schema parse 판정 밖일 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Implicit unset/0은 둘 다 getter 0·empty bytes·has 없음. Explicit unset은 getter 0·has false·empty, explicit 0은 getter 0·has true·<code>08 00</code>다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Binary message object는 raw unknown set을 재직렬화하지만 JSON은 모르는 numeric tag 의미를 표현하지 못하고 manual copy는 known accessor만 옮기기 때문이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Avro default는 reader-only field를 old bytes에서 읽을 때 채우며 writer는 default와 같아도 encode한다. Proto3 implicit scalar default는 API getter 값이고 serialize에서 생략된다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. Byte hex, API presence, relay failure window, schema resolution과 domain rollback을 한 흐름으로 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://protobuf.dev/programming-guides/field_presence/" style="color:#126246;">Protocol Buffers — Field Presence</a>: Implicit/explicit presence, default serialization, merge와 PATCH 차이를 확인한다.</li><li><a href="https://protobuf.dev/programming-guides/proto3/#unknowns" style="color:#126246;">Protocol Buffers Proto3 Guide — Unknown Fields</a>: Binary unknown 보존과 JSON·field-by-field copy의 손실 경계를 확인한다.</li><li><a href="https://protobuf.dev/programming-guides/json/" style="color:#126246;">Protocol Buffers — ProtoJSON Format</a>: Unknown field와 presence의 JSON round-trip 제약을 확인한다.</li><li><a href="https://avro.apache.org/docs/1.12.0/specification/#schema-resolution" style="color:#126246;">Apache Avro 1.12.0 Specification — Schema Resolution</a>: Reader default, missing field error와 encode-time default 규칙을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">Generated API의 구체적 <code>has/clear</code> 이름, unknown 접근 API, enum 동작은 언어·runtime에 따라 다를 수 있으므로 실제 compiler/library 조합의 공식 generated-code guide와 test로 확인한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 3 · Day 20 — 랩: compatible/incompatible 변경 matrix</strong><br>Avro·Protobuf schema 변경을 writer×reader×runtime matrix로 실행하고, parse 성공·값 손실·semantic failure를 구분해 배포 gate와 rollback 증거를 만든다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · preserve intent, prove round-trip, recover safely</td></tr>
+</table></td></tr></table></body></html>

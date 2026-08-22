@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-21T09:21:17+09:00",
+  "updatedAt": "2026-08-22T09:21:23+09:00",
   "lessons": [
     {
       "day": 1,
@@ -167,6 +167,15 @@
       "path": "day-18.html",
       "kind": "lesson",
       "publishedAt": "2026-08-21T09:21:17+09:00"
+    },
+    {
+      "day": 19,
+      "week": 3,
+      "title": "default, optional, unknown field",
+      "summary": "Wire presence와 API default, explicit optional, unknown-field round-trip, Avro reader default를 분리해 PATCH·relay·replay의 silent loss와 복구를 학습합니다.",
+      "path": "day-19.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-22T09:21:23+09:00"
     }
   ]
 }
