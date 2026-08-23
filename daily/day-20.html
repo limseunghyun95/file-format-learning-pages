@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 20</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 3 / DAY 20 · INTEGRATION LAB</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">랩: compatible/incompatible 변경 matrix</h1><div style="font-size:15px;color:#d8eee5;">Avro·Protobuf writer×reader×value 범위 검증 · 예상 학습 55분 + 실습 40분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>Schema 변경의 안전성은 diff 한 줄이 아니라 <strong>writer version × reader version × 실제 value × runtime × business invariant</strong>의 matrix다. Parse 성공만 녹색으로 칠하지 말고 값 손실, presence·unknown 보존, 조건부 범위와 rollback까지 증명해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Compatibility matrix</strong></td><td style="padding:9px;border:1px solid #d9e6df;">행에 reader, 열에 writer를 놓고 각 교차 조합의 bytes·값·오류를 기록한 표다. 방향을 잊지 않게 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Golden bytes</strong></td><td style="padding:9px;border:1px solid #d9e6df;">실제 writer/runtime이 만든 immutable byte fixture다. Schema를 보고 추측하는 대신 parser의 입력 증거로 보존한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Wire-safe</strong></td><td style="padding:9px;border:1px solid #d9e6df;">지원 방향의 parser가 경계와 값을 손실 없이 해석할 수 있는 변경이다. Application API·업무 의미까지 자동 보장하지는 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Conditionally compatible</strong></td><td style="padding:9px;border:1px solid #d9e6df;">특정 value 범위·배포 순서·runtime 조건에서는 안전하지만 조건을 벗어나면 truncation·loss가 나는 변경이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Wire-unsafe</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Cross-version parser가 frame을 올바르게 해석할 수 없거나 같은 tag를 다른 wire type으로 기대하는 변경이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Semantic failure</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Parse는 성공했지만 age를 is_admin으로 읽는 것처럼 업무 의미가 틀린 silent corruption이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Baseline</strong></td><td style="padding:9px;border:1px solid #d9e6df;">R1(W1)처럼 변경 전 자기 version 조합이다. 이것도 실패하면 fixture나 test harness가 잘못된 것이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Target</strong></td><td style="padding:9px;border:1px solid #d9e6df;">R2(W2)처럼 변경 후 자기 version 조합이다. 새 기능의 의도와 invariant를 검증한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Cross edge</strong></td><td style="padding:9px;border:1px solid #d9e6df;"><code>R2(W1)</code> backward와 <code>R1(W2)</code> forward 조합이다. Rolling deploy·rollback에서 실제 위험한 칸이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Schema resolution</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Avro가 exact writer schema로 bytes를 읽은 뒤 reader schema의 name·alias·default·promotion 규칙으로 결과를 만드는 과정이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Canary</strong></td><td style="padding:9px;border:1px solid #d9e6df;">새 writer/reader traffic을 일부만 열어 production 분포와 오류를 관찰하는 배포 단계다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Reconciliation</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Input 수·output 수·quarantine 수와 domain aggregate를 맞춰 silent loss가 없는지 확인하는 대사다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>“Field 추가는 compatible”은 절반짜리 답이다. Protobuf old reader가 new field를 unknown으로 넘겨도 JSON relay가 그것을 버릴 수 있고, new code가 field를 필수 업무값으로 쓰면 old bytes는 parse 후 실패한다. Avro reader field 추가도 default가 없으면 old writer record를 읽을 때 resolution error다.</p>
+<p>반대로 parser가 즉시 실패하는 변경은 탐지하기 쉽다. 가장 위험한 것은 같은 Protobuf field number와 wire type을 다른 의미로 재사용해 old <code>age=1</code>이 new <code>is_admin=true</code>로 조용히 읽히는 경우다. 그래서 matrix의 셀 결과는 PASS/FAIL 두 값이 아니라 최소 <strong>parse, logical value, presence/unknown, domain invariant</strong> 네 층을 가져야 한다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>Lab 불변식:</strong> 모든 supported writer generation의 실제 bytes를 모든 supported reader build로 실행한다. 통과 셀에는 입력 checksum, schema fingerprint, runtime build, expected value, 조건 범위와 evidence link가 있어야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Change proposal</strong><br>old/new schema diff + semantic contract + retention inventory</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ build fixtures from real W1/W2 runtimes</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Golden corpus</strong><br>boundary values + absent/default/unknown + malformed frame + checksum</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ fan out every fixture to every reader</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Matrix runner</strong><br>R1(W1) · R2(W1) · R1(W2) · R2(W2) × runtime builds</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ parse → normalize → invariant → round-trip</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Classifier</strong><br>SAFE · CONDITIONAL · PARSE_FAIL · SEMANTIC_FAIL</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ signed report + deploy gate + rollback pointer</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Canary / replay</strong><br>pair telemetry + quarantine + reconciliation → 확대 또는 rollback</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Data path:</strong> logical fixture → W version bytes → queue/file → R version object → domain assertion → shadow sink.<br><strong>Control path:</strong> supported version set, schema/runtime fingerprint, value range, rollout percentage, metric threshold, checkpoint와 rollback target을 전달한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">4칸은 최소 단위다</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Reader \ Writer</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">W1</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">W2</th></tr>
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;">R1</th><td style="padding:8px;border:1px solid #d9e6df;">Baseline<br><code>R1(W1)</code></td><td style="padding:8px;border:1px solid #d9e6df;">Forward / rollback<br><code>R1(W2)</code></td></tr>
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;">R2</th><td style="padding:8px;border:1px solid #d9e6df;">Backward / replay<br><code>R2(W1)</code></td><td style="padding:8px;border:1px solid #d9e6df;">Target<br><code>R2(W2)</code></td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Protobuf는 number와 wire type으로 경계를 찾는다</h3>
+<p>Tag는 <code>(field_number&lt;&lt;3)|wire_type</code>이다. 이름은 binary에 없다. 새 field number를 추가하면 old reader는 wire type으로 payload를 skip해 unknown으로 둘 수 있다. 반면 기존 number의 wire type을 VARINT에서 LEN으로 바꾸면 cross reader가 경계를 다르게 기대해 즉시 mismatch가 난다.</p>
+<p>더 위험한 경우는 number와 wire type은 같지만 의미만 바꾸는 것이다. <code>int32 age=1</code>을 <code>bool is_admin=1</code>로 재사용하면 bytes <code>08 01</code>은 두 schema 모두 정상이다. Parser error가 0이라도 권한이 상승할 수 있다. Field number는 identity이므로 삭제 뒤에도 reserve해야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 조건부 호환은 value domain이 matrix 축이다</h3>
+<p><code>int32</code>와 <code>int64</code>는 같은 VARINT wire type을 사용해 bytes를 parse할 수 있지만, new writer가 32-bit 범위를 넘는 값을 쓰면 old application에서 truncation 또는 overflow가 날 수 있다. 따라서 “type pair compatible”이 아니라 <code>|value| ≤ 2,147,483,647</code> 같은 guard를 rollout condition으로 둔다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Avro는 writer schema로 bytes를 걷고 reader schema로 결과를 만든다</h3>
+<p>Avro binary에는 field name이 없으므로 exact writer schema가 data path의 일부다. Writer field가 reader에 없으면 값을 skip할 수 있다. Reader field가 writer에 없으면 reader default를 사용하고, default가 없으면 error다. Rename은 단순 문자열 변경이 아니라 reader alias로 old writer name을 연결해야 한다.</p>
+<p>Avro <code>int→long</code> 같은 promotion은 resolution rule이지만 반대 방향은 자동으로 안전하지 않다. 또한 default가 parse를 성공시켜도 old bytes에 새 field 의미가 없었다면 business invariant는 별도로 확인해야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 판정 state machine</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">단계</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">검사와 전이</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>DECODE</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Bounded parse 실패면 PARSE_FAIL. Cursor·frame 경계를 보존한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>RESOLVE</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer/reader schema resolution과 presence/unknown/default를 기록한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>COMPARE</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Expected logical value와 차이가 있으면 LOSS 또는 SEMANTIC_FAIL.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>INVARIANT</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Unit·range·enum·PII·authorization·aggregate를 검사한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>ROUND_TRIP</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Unknown·presence 보존과 supported next reader를 검사한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>CLASSIFY</strong></td><td style="padding:8px;border:1px solid #d9e6df;">조건 없는 PASS만 SAFE. Guard가 필요하면 CONDITIONAL로 남긴다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:31%;">판단</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Best practice와 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>History 범위</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Queue TTL, object retention, offline client, rollback window 중 가장 긴 기간의 writer/reader generation을 inventory한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Fixture 선택</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Min/max/zero/null/absent, enum unknown, long string, malformed frame와 production percentile을 함께 넣는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>증거 소유</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Producer team은 golden bytes, consumer team은 expected object·invariant, platform은 runner·fingerprint·retention을 소유한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>조건부 변경</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Guard를 code assertion·metric·feature flag로 강제하고 old reader 0% 확인 뒤에만 범위를 넓힌다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>삭제/rename</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Add → dual write/read → backfill → old write 중단 → 관찰 → reserve/alias 순서로 진행한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>완료 시점</strong></td><td style="padding:8px;border:1px solid #d9e6df;">CI matrix, canary pair metrics, historical replay와 sink reconciliation이 모두 통과한 뒤 완료한다.</td></tr>
+</table>
+<h3 style="font-size:18px;color:#126246;">Anti-pattern·edge case·runtime 차이</h3>
+<ul style="padding-left:22px;"><li><strong>Registry green=배포 승인:</strong> Runtime·JSON bridge·presence·domain assertion이 빠져 있다.</li><li><strong>R2(W2)만 테스트:</strong> Baseline과 두 cross edge가 없어 rolling deploy·rollback을 검증하지 못한다.</li><li><strong>Sample 값 하나:</strong> 조건부 type change의 overflow 경계를 놓친다.</li><li><strong>Parse exception만 실패:</strong> Silent truncation·default·권한 오해석을 통과시킨다.</li><li><strong>Schema 객체로 bytes를 재생성:</strong> 실제 historical writer/runtime 특성이 사라진다. Golden bytes를 보존한다.</li><li><strong>Adjacent만 통과:</strong> Long retention이면 V1↔V3 direct edge가 비어 있다.</li><li><strong>동시 배포 가정:</strong> Queue, cache, batch replay, mobile과 rollback 때문에 version skew는 남는다.</li><li><strong>언어 하나만 실행:</strong> Enum·unknown·overflow·generated API가 runtime별로 다를 수 있다.</li><li><strong>Byte equality만 assertion:</strong> Protobuf serialization order는 canonical하지 않을 수 있다. Semantic equality와 unknown set을 본다.</li><li><strong>실패 row drop:</strong> Matrix runner 자체도 input=pass+fail reconciliation과 immutable report가 필요하다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">특정 W/R pair만 parse 실패, rollback 뒤 crash, overflow 경계에서 값 변화, unknown/default 급증, 권한·통화·합계 오염, replay에서만 failure, matrix green인데 canary semantic alert.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Immutable payload/checksum, W/R schema fingerprint, compiler/runtime build, exact pair traffic, failure offset·wire type, input value range, presence/unknown/default, bridge path, domain before/after, checkpoint·sink commit, matrix report SHA.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Field number/type reuse, wrong writer schema, missing Avro reader default/alias, conditional range 초과, implicit presence loss, JSON unknown loss, stale generated code, adjacent-only gap, malformed partial frame, rollout order 위반.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">새 writer 확대와 consumer checkpoint를 멈추고 version pair를 격리한다. Bytes·schema·runtime을 보존해 baseline/target/cross 4칸과 boundary values를 production build로 재현한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good W/R pair와 value guard로 routing하고 incompatible generation을 quarantine한다. 필요하면 tolerant reader를 먼저 배포한다. Safe checkpoint부터 idempotent replay하고 pair count·unknown/default·domain aggregate를 reconcile한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Latest schema fallback, raw bytes 수정, failed row skip 후 checkpoint, registry policy 즉석 완화, field number 재재사용, condition guard 제거, evidence 없이 cache clear, idempotency 없는 replay, new bytes 확인 없이 old binary만 rollback하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 40분 통합 실습: 변경 matrix를 코드로 판정</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리로 Protobuf-like tag stream과 Avro-like resolution을 구현해 safe·conditional·parse failure·semantic failure를 한 번에 분류한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package·<code>protoc</code>는 필요 없다. 교육용 bounded model이며 production runtime 대체가 아니다.</p>
+<p><strong>실행 전 예측:</strong> 다음 네 변경의 두 cross edge를 먼저 적는다: (A) 새 field 3 추가, (B) field 2 string→bool, (C) field 1 age→is_admin 같은 VARINT 재사용, (D) int32→int64에서 2,147,483,648 기록.</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+I32_MAX = 2_147_483_647
+
+def varint(n):
+    out = bytearray()
+    while n &gt; 0x7f:
+        out.append((n &amp; 0x7f) | 0x80); n &gt;&gt;= 7
+    out.append(n); return bytes(out)
+
+def field(no, wire, value):
+    key = varint((no &lt;&lt; 3) | wire)
+    if wire == 0: return key + varint(value)
+    raw = value.encode(); return key + varint(len(raw)) + raw
+
+def readv(buf, p):
+    n = 0
+    for i in range(10):
+        if p &gt;= len(buf): raise ValueError("TRUNCATED_VARINT")
+        b = buf[p]; p += 1; n |= (b &amp; 0x7f) &lt;&lt; (7*i)
+        if b &lt; 128: return n, p
+    raise ValueError("OVERLONG_VARINT")
+
+def parse(buf, schema, max_len=256):
+    p, obj, unknown = 0, {}, []
+    while p &lt; len(buf):
+        key, p = readv(buf, p); no, wire = key &gt;&gt; 3, key &amp; 7
+        if no == 0 or wire not in (0,2): raise ValueError("BAD_TAG")
+        if wire == 0: value, p = readv(buf, p)
+        else:
+            size, p = readv(buf, p)
+            if size &gt; max_len or size &gt; len(buf)-p: raise ValueError("BAD_LEN")
+            value, p = buf[p:p+size].decode(), p+size
+        spec = schema.get(no)
+        if spec is None: unknown.append((no,wire,value)); continue
+        name, expected = spec
+        if wire != expected: raise ValueError(f"WIRE_MISMATCH:{no}:{wire}!={expected}")
+        obj[name] = value
+    return obj, unknown
+
+def classify(label, raw, reader, invariant=lambda x: True):
+    try:
+        obj, unknown = parse(raw, reader)
+        status = "SAFE" if invariant(obj) else "SEMANTIC_FAIL"
+        print(f"{label:24}", status, obj, "unknown=", unknown)
+    except Exception as e: print(f"{label:24}", "PARSE_FAIL", e)
+
+V1 = {1:("age",0), 2:("name",2)}
+V2_ADD = {1:("age",0), 2:("name",2), 3:("email",2)}
+W1 = field(1,0,21) + field(2,2,"kim")
+W2_ADD = W1 + field(3,2,"k@example.com")
+classify("R2_ADD(W1)", W1, V2_ADD)
+classify("R1(W2_ADD)", W2_ADD, V1)
+
+V2_TYPE = {1:("age",0), 2:("active",0)}
+W2_TYPE = field(1,0,21) + field(2,0,1)
+classify("R2_TYPE(W1)", W1, V2_TYPE)
+classify("R1(W2_TYPE)", W2_TYPE, V1)
+
+V2_REUSE = {1:("is_admin",0), 2:("name",2)}
+classify("R2_REUSE(W1)", W1, V2_REUSE,
+         lambda o: o.get("is_admin") in (0,1))
+print("  note: age=21 parsed, but authorization meaning is corrupted")
+
+def old_int32(n):
+    return n if n &lt;= I32_MAX else n - (1 &lt;&lt; 32)
+for n in (100, I32_MAX, I32_MAX+1):
+    observed = old_int32(n)
+    status = "SAFE_UNDER_GUARD" if observed == n else "LOSS_OUTSIDE_GUARD"
+    print("int64-&gt;old_int32", n, observed, status)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Field 추가는 두 cross parser가 성공하고 old reader는 field 3을 unknown으로 본다. Wire type 변경은 두 방향 모두 mismatch다. 같은 wire type의 번호 재사용은 parse가 성공하지만 <code>age=21</code>이 권한 값으로 들어가는 semantic failure다. int64→old int32는 경계까지 조건부로만 안전하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 Avro-like resolution matrix</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def resolve(writer_record, reader_schema):
+    out = {}
+    for rname, spec in reader_schema.items():
+        candidates = [rname] + spec.get("aliases", [])
+        hit = next((n for n in candidates if n in writer_record), None)
+        if hit is not None: out[rname] = writer_record[hit]
+        elif "default" in spec: out[rname] = spec["default"]
+        else: raise ValueError("MISSING_NO_DEFAULT:" + rname)
+    return out
+
+W1 = {"id":7, "amount":1000}
+cases = {
+ "add_with_default": {"id":{}, "amount":{}, "currency":{"default":"KRW"}},
+ "add_no_default": {"id":{}, "amount":{}, "currency":{}},
+ "remove_amount": {"id":{}},
+ "rename_with_alias": {"id":{}, "total":{"aliases":["amount"]}},
+ "rename_no_alias": {"id":{}, "total":{}},
+}
+for name, reader in cases.items():
+    try: print(f"{name:20}", "SAFE", resolve(W1, reader))
+    except Exception as e: print(f"{name:20}", "RESOLUTION_FAIL", e)
+
+same_old = {"id":7, "amount":1000}
+for default in ("KRW", "USD"):
+    result = resolve(same_old, {"id":{},"amount":{},"currency":{"default":default}})
+    print("same bytes/default", default, "-&gt;", result, "SEMANTIC_REVIEW_REQUIRED")
+PY</code></div>
+<p><strong>예상 관찰:</strong> Add-with-default, reader field 제거, alias rename은 resolution이 성공한다. Add-without-default와 alias 없는 rename은 실패한다. Default 변경은 parse 성공이지만 같은 old data의 결과를 바꾸므로 semantic review가 필요하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 실패 주입·자주 나는 오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입:</strong> 첫 실습의 <code>age=21</code>을 1로 바꾸면 number reuse가 더 위험해진다. Parser와 간단한 bool invariant까지 모두 통과해 권한 오염이 완전히 silent하다.</li><li><strong>조건부 범위 누락:</strong> 100만 테스트하지 말고 boundary±1과 production max를 넣는다.</li><li><strong>Alias 방향 혼동:</strong> Reader schema alias가 old writer name을 매칭하는지 실제 library로 확인한다.</li><li><strong>Unknown=loss로 단정:</strong> Old reader의 unknown 보존과 downstream round-trip을 별도 assertion으로 둔다.</li><li><strong>Default=업무 승인:</strong> Resolution 성공 뒤 currency·권한·unit invariant를 실행한다.</li></ul>
+<p><strong>Cleanup:</strong> 두 명령은 파일·package·container를 만들지 않는다. 실제 golden bytes에는 PII가 있을 수 있으므로 보호 저장소와 access log를 사용하고 terminal·CI log에 raw payload를 남기지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Matrix 행/열에 R/W 방향을 명시한다.</li><li>Baseline·target·두 cross edge를 모두 실행한다.</li><li>Schema pair뿐 아니라 value range와 runtime을 축으로 둔다.</li><li>Parse 성공, logical equality, presence/unknown, domain invariant를 따로 판정한다.</li><li>조건부 PASS를 SAFE로 승격하지 않는다.</li><li>Historical bytes를 새 writer로 재생성하지 않는다.</li><li>Avro exact writer schema fingerprint를 payload와 함께 보존한다.</li><li>Protobuf field number는 삭제 후 reserve하고 재사용하지 않는다.</li><li>JSON/Text bridge는 binary matrix와 별도 경로로 실행한다.</li><li>CI 결과와 production canary/replay reconciliation을 연결한다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Schema compatibility test platform을 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Producer/consumer·retention·rollback SLA를 묻는다 → writer×reader×runtime×value matrix를 그린다 → immutable golden bytes·fingerprint·expected object를 정의한다 → parse/presence/unknown/domain/round-trip gate를 단계화한다 → canary·quarantine·checkpoint·reconciliation과 비용 최적화를 방어한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Protobuf field number 재사용이 같은 wire type일 때 더 위험할 수 있는 이유는?</h3>
+<p><strong>좋은 답변 구조:</strong> Tag에 name이 없고 number+wire type만 있다는 byte 원리를 말한다 → <code>08 01</code>의 age→is_admin 예를 든다 → parser/registry가 성공해 silent corruption·PII/권한 사고가 됨을 설명한다 → reserve, expand-contract, golden semantic fixture와 rollback을 제안한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. int32→int64 변경이 조건부 호환일 때 배포 절차를 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Old reader 비율과 max value를 수치로 확인한다 → boundary matrix와 overflow behavior를 runtime별 검증한다 → readers-first, writer guard≤INT32_MAX, metric·feature flag를 둔다 → old reader 0%와 rollback horizon 뒤 guard를 완화한다 → 손실 generation quarantine/replay 계획을 말한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Implicit 0과 explicit optional 0의 wire·presence 차이는?</li><li>Unknown field가 binary relay와 JSON/manual copy에서 다르게 동작하는 이유는?</li><li>Avro reader default가 writer field 생략 허가가 아닌 이유는?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Compatibility matrix의 최소 네 칸과 각 운영 의미를 쓰라.</li><li>Protobuf field 추가, wire type 변경, 같은 wire type 번호 재사용을 네 등급으로 분류하라.</li><li>Avro reader field 추가·rename을 안전하게 만들 조건과 semantic 검사를 설명하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Implicit unset/0은 empty bytes로 합쳐진다. Explicit unset은 empty·has false, explicit 0은 <code>08 00</code>·has true다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Binary object는 raw unknown set을 재직렬화하지만 JSON은 numeric tag 의미를 담지 못하고 manual copy는 known accessor만 옮긴다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Avro writer는 default와 같아도 field를 encode한다. Reader default는 writer에 없는 field를 read-time에 materialize한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">R1(W1) baseline, R2(W2) target, R2(W1) backward/replay, R1(W2) forward/rollback이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">새 number 추가는 binary wire-safe, 같은 field의 wire type 변경은 parse fail, 같은 number/type 의미 재사용은 semantic fail이다. int 폭 변경은 value guard가 필요한 conditional일 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">추가 field는 reader default, rename은 reader alias가 필요하다. 그 뒤 default·unit·presence·aggregate가 old bytes에서 같은 의미인지 검증한다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. Matrix 축, byte mechanism, silent failure, rollout guard, quarantine·rollback·reconciliation을 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://protobuf.dev/programming-guides/proto3/#updating" style="color:#126246;">Protocol Buffers Proto3 Guide — Updating A Message Type</a>: Wire-safe·unsafe·conditionally compatible 변경과 unknown 처리 기준을 확인한다.</li><li><a href="https://protobuf.dev/best-practices/dos-donts/" style="color:#126246;">Protocol Buffers Best Practices</a>: Field number reserve, type/default 변경 회피와 배포 가정을 확인한다.</li><li><a href="https://protobuf.dev/programming-guides/field_presence/" style="color:#126246;">Protocol Buffers — Field Presence</a>: Matrix에 presence와 merge/default 축이 필요한 이유를 확인한다.</li><li><a href="https://avro.apache.org/docs/1.12.0/specification/#schema-resolution" style="color:#126246;">Apache Avro 1.12.0 Specification — Schema Resolution</a>: Writer/reader record field, default, promotion, alias resolution을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">Registry 제품의 BACKWARD/FORWARD/FULL 명칭과 history 범위는 제품 설정에서 다시 확인한다. 여기서는 혼동을 피하기 위해 항상 <code>R_version(W_version(bytes))</code>와 실제 fixture 결과를 기록한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 3 · Day 21 — 회상: rename·reuse가 위험한 이유</strong><br>Week 3 전체를 한 장의 field identity·schema resolution·compatibility matrix로 회상하고, rename·number reuse 사고를 면접 답변과 schema review checklist로 방어한다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · matrix evidence, guarded rollout, reversible recovery</td></tr>
+</table></td></tr></table></body></html>

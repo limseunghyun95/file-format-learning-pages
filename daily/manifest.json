@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-22T09:21:23+09:00",
+  "updatedAt": "2026-08-23T09:32:37+09:00",
   "lessons": [
     {
       "day": 1,
@@ -176,6 +176,15 @@
       "path": "day-19.html",
       "kind": "lesson",
       "publishedAt": "2026-08-22T09:21:23+09:00"
+    },
+    {
+      "day": 20,
+      "week": 3,
+      "title": "랩: compatible/incompatible 변경 matrix",
+      "summary": "Avro·Protobuf writer×reader×value matrix로 wire-safe, 조건부 호환, parse failure와 silent semantic failure를 재현하고 배포 gate·rollback 증거를 만듭니다.",
+      "path": "day-20.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-23T09:32:37+09:00"
     }
   ]
 }
