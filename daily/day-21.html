@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 21</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 3 / DAY 21 · REVIEW</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">회상: rename·reuse가 위험한 이유</h1><div style="font-size:15px;color:#d8eee5;">Field identity·schema resolution·rollback을 한 장으로 연결 · 예상 학습 55분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>이름은 사람이 보는 label이고, serialization이 field를 식별하는 규칙은 format마다 다르다. Protobuf는 <strong>field number</strong>, Avro record resolution은 <strong>name·reader alias</strong>가 핵심이다. Rename·reuse를 UI refactor처럼 다루면 old bytes가 새 의미로 조용히 오염되므로 identity를 영구 계약으로 관리해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Field identity</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Schema version이 달라도 “같은 논리 field”임을 연결하는 식별 계약이다. Format마다 number, name, ID, alias 등 기준이 다르다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Rename</strong></td><td style="padding:9px;border:1px solid #d9e6df;">같은 의미를 유지하며 사람이 보는 이름을 바꾸는 변경이다. Wire·JSON·generated API·query name에서 효과가 서로 다르다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Reuse</strong></td><td style="padding:9px;border:1px solid #d9e6df;">과거 field가 쓰던 number/name/enum value를 다른 의미에 다시 배정하는 것이다. Historical bytes가 남아 있으면 identity 충돌이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Reserved</strong></td><td style="padding:9px;border:1px solid #d9e6df;">삭제한 Protobuf field number/name을 미래 schema에서 다시 쓰지 못하게 막는 compile-time tombstone이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Alias</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Avro reader가 새 name을 old writer name과 연결하도록 선언한 대체 이름이다. 임의 rename을 자동 추론하는 기능은 아니다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Tombstone</strong></td><td style="padding:9px;border:1px solid #d9e6df;">삭제 사실과 재사용 금지를 영구 기록한 표식이다. Data가 사라진 뒤에도 offline client·backup 때문에 유지할 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Expand-contract</strong></td><td style="padding:9px;border:1px solid #d9e6df;">새 field를 추가하고 dual read/write·backfill한 뒤 old field를 단계적으로 제거하는 가역 migration 방식이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Semantic migration</strong></td><td style="padding:9px;border:1px solid #d9e6df;">이름만 바꾸는 것이 아니라 unit·range·meaning까지 바뀔 때 변환 규칙과 provenance를 적용하는 data migration이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Replay horizon</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Historical bytes가 다시 읽힐 수 있는 최장 기간이다. Queue TTL, object retention, backup, offline client를 포함한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Shadow read</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Old/new reader를 같은 bytes에 실행해 결과를 비교하되 새 결과는 production state에 적용하지 않는 검증이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Schema fingerprint</strong></td><td style="padding:9px;border:1px solid #d9e6df;">정규화된 schema를 식별하는 hash/ID다. Payload를 어떤 writer schema로 해석했는지 추적한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Silent corruption</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Parser는 성공했지만 잘못된 logical value가 sink에 commit되어 오류가 늦게 발견되는 장애다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>Protobuf binary에는 field name이 없다. <code>int32 age = 1</code>의 bytes <code>08 01</code>은 V2가 <code>bool is_admin = 1</code>로 number를 재사용해도 잘 형성된 VARINT다. Old age=1이 new is_admin=true로 읽히면 parser error·registry error가 모두 0인 채 권한이 상승한다.</p>
+<p>반대로 Protobuf에서 name만 바꾸고 number·type을 유지하면 binary는 읽힐 수 있지만 ProtoJSON, TextFormat, generated API, log/query field name은 깨질 수 있다. Avro에서는 binary에 field name이 없더라도 reader resolution이 schema name으로 field를 맞추므로 alias 없는 rename은 old writer field와 연결되지 않는다. “Rename은 안전/위험”이 아니라 <strong>어떤 representation과 identity rule인가</strong>를 먼저 답해야 한다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>Week 3 최종 불변식:</strong> Field의 number/name/type/presence/default/semantic unit과 lifecycle 상태(active→deprecated→reserved)를 한 ledger에서 관리한다. Registry pass가 아니라 supported bytes의 reader×writer×runtime×business matrix가 배포 증거다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 사고 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① V1 producer</strong><br><code>age=1, field number=1, wire=VARINT</code></td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ serialize tag/value = 08 01</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Queue / object / backup</strong><br>Bytes + writer fingerprint + retention state</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ months later, V2 reuses number 1</td></tr>
+<tr><td style="padding:12px;border:1px solid #f0b4b4;background:#fff2f2;"><strong>③ V2 reader</strong><br><code>is_admin=true</code> · parse success · unknown=0</td></tr>
+<tr><td style="padding:5px;color:#a23a3a;font-weight:700;">↓ domain validation omitted</td></tr>
+<tr><td style="padding:12px;border:1px solid #f0b4b4;background:#fff2f2;"><strong>④ Authorization sink</strong><br>Privilege committed · checkpoint advanced</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ late detection by aggregate/audit</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Recovery</strong><br>Stop writer → preserve evidence → tolerant old/new reader → quarantine → idempotent replay</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Data path:</strong> V1 logical value → tag-value bytes → retained storage → V2 object → domain decision → sink.<br><strong>Control path:</strong> Field ledger, reserved set, schema fingerprint, supported generation, compatibility matrix, rollout guard, checkpoint와 rollback pointer를 전달한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">Format별 identity map</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">표현</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">주 identity</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Rename/reuse 위험</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Protobuf binary</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Field number + wire type</td><td style="padding:8px;border:1px solid #d9e6df;">Name-only rename은 binary 가능, number reuse는 ambiguity/corruption</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>ProtoJSON/Text</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Field name mapping</td><td style="padding:8px;border:1px solid #d9e6df;">Name rename이 client·stored JSON을 깨뜨릴 수 있음</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Avro binary+schema</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer schema traversal + reader name/alias</td><td style="padding:8px;border:1px solid #d9e6df;">Alias 없는 rename은 missing/default/error로 분기</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Business domain</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Stable meaning·unit·range</td><td style="padding:8px;border:1px solid #d9e6df;">같은 type/name이어도 의미 reuse는 silent failure</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작과 Week 3 연결</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Logical value에서 bytes까지</h3>
+<p>Schema는 logical field를 physical encoding으로 매핑한다. Protobuf field number와 wire type은 tag를 만들고, integer는 varint/zig-zag 규칙으로 payload가 된다. Avro는 writer schema의 depth-first 순서로 field name 없이 payload를 기록한다. Decode 시 필요한 identity metadata가 없거나 잘못되면 같은 bytes가 다른 object가 된다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Compatibility 방향</h3>
+<p>Backward는 <code>R_new(W_old)</code>, forward는 <code>R_old(W_new)</code>다. Rename/reuse review는 baseline·target과 두 cross edge를 모두 실행해야 한다. Rollback은 code를 되돌리는 행동이 아니라 이미 생성된 W_new bytes를 R_old가 안전하게 읽는다는 forward 증명이 포함된 상태 전이다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Presence·default·unknown</h3>
+<p>Identity가 맞아도 absent와 explicit default를 접으면 PATCH 의미가 사라진다. Protobuf old reader가 new number를 unknown으로 보존할 수 있지만 JSON/manual copy에서 유실될 수 있다. Avro alias가 연결돼도 reader default 변화가 old bytes의 결과를 바꿀 수 있다. 그러므로 field ledger는 identity뿐 아니라 presence discipline과 default version까지 포함한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Failure window와 비용</h3>
+<p>Reuse failure window는 producer 배포 순간부터가 아니라 과거 bytes가 생성된 최초 시점까지 거슬러 올라간다. 모든 historical generation을 영구 matrix에 넣으면 비용이 커지므로 retention class, traffic percentile, risk tier로 fixture를 계층화하되 PII·권한·금액 field는 full transitive evidence를 유지하는 편이 안전하다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 schema review checklist</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:28%;">단계</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">필수 질문과 승인 증거</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Identity</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Format별 identity는 무엇인가? Number/name/alias/type/unit가 기존 ledger와 충돌하지 않는가?</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>History</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Queue·object·backup·offline client·rollback의 최장 horizon과 실제 writer fingerprints는?</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Representation</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Binary 외에 JSON/Text/log/query/cache key에서 이름을 사용하는가?</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Semantics</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Unit, range, enum, presence, default, PII, authorization invariant가 유지되는가?</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Migration</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Add/dual read-write/backfill/old-write stop/reserve·alias 순서와 각 성공 조건은?</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Matrix</strong></td><td style="padding:8px;border:1px solid #d9e6df;">R1(W1), R2(W1), R1(W2), R2(W2) × boundary × runtime의 golden 결과 SHA는?</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Operations</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Pair별 metric, quarantine capacity, checkpoint, idempotency key, rollback pointer와 reconciliation은?</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Retirement</strong></td><td style="padding:8px;border:1px solid #d9e6df;">삭제 number/name/enum value를 tombstone하고 ledger·compiler·lint가 재사용을 막는가?</td></tr>
+</table>
+
+<h3 style="font-size:18px;color:#126246;">Best practice·anti-pattern·edge case</h3>
+<ul style="padding-left:22px;"><li><strong>Best:</strong> Protobuf number는 한 번 할당하면 영구 identity로 보고 삭제 뒤 number/name을 reserve한다.</li><li><strong>Best:</strong> Avro rename은 reader alias, old/new fixture와 exact writer schema로 검증한다.</li><li><strong>Best:</strong> 의미 변경은 rename이 아니라 새 field+명시적 transform+provenance로 migration한다.</li><li><strong>Anti-pattern:</strong> 번호를 보기 좋게 재정렬한다. 이는 field 전체를 삭제·추가하는 것과 같다.</li><li><strong>Anti-pattern:</strong> Binary matrix만 통과하고 ProtoJSON·Text·REST client를 무시한다.</li><li><strong>Anti-pattern:</strong> Retention이 끝났다는 추측으로 reserved를 해제한다. Backup·DLQ·offline client가 남을 수 있다.</li><li><strong>Edge:</strong> 같은 number와 같은 wire type의 reuse는 parser가 성공해 더 위험하다.</li><li><strong>Edge:</strong> Avro alias가 wire resolution을 살려도 generated API·SQL column name·downstream catalog는 별도 migration이 필요하다.</li><li><strong>Runtime:</strong> Unknown enum, TextFormat reserved name, generated has/clear API는 언어·runtime 차이를 matrix에 넣는다.</li><li><strong>완료:</strong> Tombstone commit, canary/replay 대사와 rollback reader 검증 뒤에만 old field를 retire한다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Parse error 없이 권한·PII·금액 값 오염, 특정 historical generation에서만 rename field missing, JSON client 4xx, unknown/default 급증, rollback 뒤 crash, replay aggregate 불일치.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Immutable bytes/checksum, writer/reader schema fingerprint, field ledger와 reserved history, runtime build, binary/JSON path, field number·wire type·name·alias, presence/unknown/default, first/last affected offset, checkpoint·sink commit, domain audit.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Number/enum value reuse, alias 누락/방향 오류, JSON name rename, wrong writer schema, stale generated code, implicit presence loss, reader default 변화, unknown bridge loss, adjacent-only gap, semantic unit reuse.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Affected writer 확대와 checkpoint를 멈추고 version pair·generation을 격리한다. Bytes·schema·runtime·domain audit를 보존하고 old/new identity map으로 4칸 matrix와 shadow read를 재현한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good W/R routing과 tolerant reader를 먼저 복구한다. Corrupt semantic generation은 quarantine하고 ledger/tombstone을 수정한다. Safe checkpoint에서 idempotent replay하고 identity별 count·domain aggregate·audit를 reconcile한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Raw bytes의 tag/name을 일괄 치환, latest schema fallback, reserved 해제, unknown/default 임의 보정, failed row skip 후 checkpoint, evidence 없는 cache clear, old/new 값을 같은 column에 무표식 혼합, idempotency 없는 replay를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: history auditor와 사고 재현</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리로 Protobuf field ledger 충돌과 Avro alias rename을 감사하고, 같은 bytes가 다른 meaning으로 parse되는 silent incident를 재현한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package·<code>protoc</code>는 필요 없다. 교육용 model이며 실제 runtime matrix를 대체하지 않는다.</p>
+<p><strong>실행 전 예측:</strong> V1 <code>age=1</code> 삭제 후 V3 <code>is_admin=1</code>, Protobuf name-only rename, Avro alias 유/무의 결과를 적고 어느 검사가 parser error 없이 사고를 잡는지 예상한다.</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def audit_proto(history):
+    seen, retired = {}, set()
+    issues = []
+    for version in history:
+        retired |= set(version.get("reserved", []))
+        for no, spec in version["fields"].items():
+            name, wire, meaning = spec
+            if no in retired:
+                issues.append((version["v"], no, "USES_RESERVED", name))
+            if no in seen and seen[no][2] != meaning:
+                issues.append((version["v"], no, "SEMANTIC_REUSE", seen[no][2]+"-&gt;"+meaning))
+            seen.setdefault(no, spec)
+    return issues
+
+bad = [
+ {"v":"V1", "fields":{1:("age",0,"person_age"),2:("name",2,"display_name")}},
+ {"v":"V2", "fields":{2:("name",2,"display_name")}, "reserved":[]},
+ {"v":"V3", "fields":{1:("is_admin",0,"authorization"),2:("full_name",2,"display_name")}},
+]
+good = [
+ {"v":"V1", "fields":{1:("age",0,"person_age"),2:("name",2,"display_name")}},
+ {"v":"V2", "fields":{2:("name",2,"display_name")}, "reserved":[1]},
+ {"v":"V3", "fields":{2:("full_name",2,"display_name"),3:("is_admin",0,"authorization")}, "reserved":[1]},
+]
+print("bad_history=", audit_proto(bad))
+print("good_history=", audit_proto(good))
+
+# bytes 08 01: field 1, VARINT, value 1
+raw = bytes.fromhex("08 01")
+tag, value = raw
+no, wire = tag &gt;&gt; 3, tag &amp; 7
+for schema in ({1:"age"},{1:"is_admin"}):
+    print("same_bytes", raw.hex(" "), "schema=", schema,
+          "decoded=", {schema[no]:value}, "wire=", wire)
+print("parser_success_but_meaning_changed=", True)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Bad history는 field 1의 semantic reuse를 찾는다. Good history는 number 1을 reserve하고 권한 field에 새 number 3을 써 통과한다. <code>08 01</code>은 age와 is_admin 두 schema에서 모두 parse되므로 semantic ledger·golden assertion이 없으면 사고를 못 잡는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.2 Avro rename과 representation matrix</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+def resolve(writer_record, reader):
+    out={}
+    for new_name,spec in reader.items():
+        names=[new_name]+spec.get("aliases",[])
+        old=next((n for n in names if n in writer_record),None)
+        if old is not None: out[new_name]=writer_record[old]
+        elif "default" in spec: out[new_name]=spec["default"]
+        else: raise ValueError("MISSING:"+new_name)
+    return out
+
+old={"amount":1000,"currency":"KRW"}
+for label,reader in [
+ ("alias",{"total":{"aliases":["amount"]},"currency":{}}),
+ ("no_alias",{"total":{},"currency":{}}),
+ ("bad_default",{"total":{"default":0},"currency":{}}),
+]:
+    try:
+        result=resolve(old,reader)
+        semantic_ok=result.get("total")==old["amount"]
+        print(label,result,"semantic_ok=",semantic_ok)
+    except Exception as e: print(label,"RESOLUTION_FAIL",e)
+
+paths={"protobuf_binary":"number", "proto_json":"name",
+       "avro_resolution":"reader_name_or_alias", "domain":"meaning_and_unit"}
+for path,identity in paths.items(): print(path,"identity=",identity)
+PY</code></div>
+<p><strong>예상 관찰:</strong> Alias rename은 old amount를 new total로 연결한다. Alias가 없으면 error, default 0을 넣으면 parse/resolution은 성공하지만 1000이 0으로 바뀌어 semantic failure다. 같은 rename도 binary·JSON·Avro·domain 경로별 identity가 다르다.</p>
+
+<h3 style="font-size:18px;color:#126246;">7.3 실패 주입·오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입:</strong> 첫 코드의 old age를 21 대신 1로 유지하면 bool range 검사까지 통과한다. 의미 ledger만 사고를 잡는다.</li><li><strong>Reserved만 검사:</strong> 과거 meaning ledger도 비교해야 삭제 전에 이미 재사용된 충돌을 잡는다.</li><li><strong>Name-only audit:</strong> Protobuf number와 JSON name을 별도 identity 축으로 검사한다.</li><li><strong>Alias+default 동시 사용:</strong> Alias 누락이 default로 가려지지 않게 “default materialized count”를 metric으로 둔다.</li><li><strong>Raw payload logging:</strong> PII 대신 checksum, field number/wire type/size와 보호 저장소 pointer를 기록한다.</li></ul>
+<p><strong>Cleanup:</strong> 두 명령은 파일·package·container를 만들지 않는다. Production schema ledger를 실습에 복사할 때 내부 이름·PII classification을 제거하고 결과만 review artifact로 보존한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>사람이 보는 name과 wire identity를 분리한다.</li><li>Protobuf number 재정렬도 reuse와 같은 incompatible change다.</li><li>같은 wire type reuse는 parse 성공 때문에 더 위험하다.</li><li>Protobuf binary rename과 JSON/API rename을 별도 검증한다.</li><li>Avro alias는 reader 쪽에서 old writer name을 연결한다.</li><li>Default로 rename failure를 숨기지 않는다.</li><li>Meaning·unit 변경은 새 field와 migration으로 처리한다.</li><li>Reserved/tombstone은 retention 종료 추정만으로 제거하지 않는다.</li><li>Registry pass와 semantic matrix를 혼동하지 않는다.</li><li>Rollback 전에 old reader가 이미 생성된 new bytes를 읽는지 확인한다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Protobuf field rename과 number reuse를 구분해 설명하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Binary tag가 number+wire type임을 말한다 → name-only rename은 binary 가능하지만 JSON/generated API 영향이 있음을 분리한다 → number reuse의 same-wire silent corruption 예를 든다 → reserve/tombstone, expand-contract와 cross matrix를 제안한다 → PII·권한 사고 복구까지 방어한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Avro field를 amount에서 total로 바꾸는 무중단 절차는?</h3>
+<p><strong>좋은 답변 구조:</strong> Writer schema와 reader name/alias resolution을 정의한다 → retention writer generations를 inventory한다 → reader alias와 dual read/write, shadow replay, backfill을 설계한다 → default로 누락을 숨기지 않고 materialization metric을 둔다 → old writer 중단·reconcile·rollback 뒤 retire한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Schema registry가 허용한 변경으로 권한 사고가 났습니다. 대응과 재발 방지를 말하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> 새 writer/consumer checkpoint를 정지한다 → immutable bytes·fingerprint·identity ledger·audit를 수집한다 → version pair별 재현과 affected generation을 계산한다 → tolerant reader·quarantine·idempotent replay로 복구한다 → semantic ledger lint, golden matrix, canary domain alert와 tombstone policy를 추가한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Compatibility matrix의 최소 네 칸과 운영 의미는?</li><li>Wire-safe, conditional, parse failure, semantic failure의 판정 차이는?</li><li>Avro add-with-default와 rename-with-alias가 각각 해결하는 cross edge는?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>왜 Protobuf 같은 number·wire type 재사용이 즉시 parse failure보다 위험할 수 있는가?</li><li>Protobuf binary rename, ProtoJSON rename, Avro rename의 identity 규칙을 비교하라.</li><li>Field retirement review checklist의 최소 다섯 증거를 제시하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">R1(W1) baseline, R2(W2) target, R2(W1) backward/replay, R1(W2) forward/rollback이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Safe는 조건 없는 값 보존, conditional은 range/rollout guard 필요, parse failure는 decode/resolution error, semantic failure는 parse 성공 뒤 의미 위반이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Reader default는 R_new(W_old)의 새 field를 채우고, reader alias는 old writer name을 new reader name과 연결한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Tag가 유효해 parser·registry가 성공하고 old 값이 새 의미로 sink에 commit되므로 탐지가 늦다. 권한·PII면 피해가 크다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Protobuf binary는 number, ProtoJSON은 name mapping, Avro resolution은 reader name/alias와 exact writer schema가 identity를 결정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Identity ledger, retention inventory, representation map, 4칸 golden matrix, semantic invariant, migration state, canary metrics, quarantine/checkpoint/rollback, reserved tombstone 중 다섯 이상.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. Identity rule, byte example, version skew, semantic incident, reversible migration과 evidence를 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://protobuf.dev/programming-guides/proto3/#assigning-field-numbers" style="color:#126246;">Protocol Buffers Proto3 Guide — Assigning Field Numbers</a>: Number가 wire identity이며 재사용이 ambiguity·PII leak·corruption을 만들 수 있음을 확인한다.</li><li><a href="https://protobuf.dev/programming-guides/proto3/#deleting" style="color:#126246;">Protocol Buffers Proto3 Guide — Deleting Fields</a>: 삭제 number와 name을 reserve하는 규칙을 확인한다.</li><li><a href="https://protobuf.dev/best-practices/dos-donts/" style="color:#126246;">Protocol Buffers Best Practices</a>: Tag reuse 금지, type 변경 회피와 migration 원칙을 확인한다.</li><li><a href="https://avro.apache.org/docs/1.12.0/specification/#aliases" style="color:#126246;">Apache Avro 1.12.0 Specification — Aliases</a>: Reader alias가 writer schema name을 매칭하도록 resolution하는 규칙을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">TextFormat reserved name과 unknown enum/generated API 동작은 runtime별 차이가 있을 수 있다. 실제 compiler/library version의 공식 generated-code guide와 golden test로 확인한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 4 · Day 22 — columnar locality와 OLAP workload</strong><br>같은 logical table이 row layout과 column layout에서 cache line·I/O request·compression·vector batch를 어떻게 다르게 사용하는지 query cost로 계산한다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · identity is permanent, evidence is executable, recovery is reversible</td></tr>
+</table></td></tr></table></body></html>
