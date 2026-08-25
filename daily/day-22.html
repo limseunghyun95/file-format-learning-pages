@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 22</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 4 / DAY 22 · LESSON</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">columnar locality와 OLAP workload</h1><div style="font-size:15px;color:#d8eee5;">Projection·cache line·range read·vector batch를 하나의 비용 모델로 연결 · 예상 학습 60분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>컬럼형 저장의 핵심은 “행을 세로로 보관한다”가 아니라, 분석 쿼리가 필요한 열의 연속 byte만 읽고 같은 type의 값을 batch로 decode·계산하게 만드는 <strong>물리적 locality</strong>다. 이득은 projection이 좁고 scan·aggregate가 클수록 커지며, point lookup·한 행 write·wide projection에서는 반대로 비용이 될 수 있다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>OLAP</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Online Analytical Processing. 많은 행을 읽어 필터·집계·조인하는 분석 workload다. “지난달 지역별 매출 합계”가 대표적이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>OLTP</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Online Transaction Processing. 소수 행을 key로 찾고 짧게 읽고 쓰는 거래 workload다. 주문 한 건 조회·수정이 대표적이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Row layout</strong></td><td style="padding:9px;border:1px solid #d9e6df;">한 행의 모든 field byte를 가까이 둔다. 한 행 전체를 가져올 때 locality가 좋지만 한 열만 scan해도 다른 field가 함께 읽힐 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Columnar layout</strong></td><td style="padding:9px;border:1px solid #d9e6df;">같은 열의 여러 행 값을 가까이 둔다. 실제 Parquet·ORC는 파일 전체를 열별 한 덩어리로 만들지 않고 row group·stripe 안에서 열별 stream을 구성한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Locality</strong></td><td style="padding:9px;border:1px solid #d9e6df;">곧 사용할 byte가 저장장치·메모리·CPU cache에서 가까이 있는 성질이다. Spatial locality는 인접 주소, temporal locality는 최근 값을 다시 쓰는 성질이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Cache line</strong></td><td style="padding:9px;border:1px solid #d9e6df;">CPU cache와 memory 사이를 옮기는 고정 크기 block이다. 64B는 흔한 예시지만 모든 CPU의 보편 규칙은 아니다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Projection</strong></td><td style="padding:9px;border:1px solid #d9e6df;"><code>SELECT amount, region</code>처럼 query가 실제 결과·계산에 요구하는 열 집합이다. Projection pushdown은 reader가 불필요한 열을 읽지 않게 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Selectivity</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Predicate를 통과하는 행의 비율이다. 1억 행 중 100만 행이면 1%다. 읽기 전에 skip 가능한 범위와 decode 후 걸러지는 비율을 구분한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>I/O amplification</strong></td><td style="padding:9px;border:1px solid #d9e6df;">논리적으로 필요한 byte보다 실제 storage·network에서 더 많이 읽는 비율이다. 필요한 1GB를 위해 20GB를 읽으면 20배다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Vectorization</strong></td><td style="padding:9px;border:1px solid #d9e6df;">값을 한 건씩 object로 처리하지 않고 동일 type의 연속 batch로 decode·계산하는 실행 방식이다. Function call·branch·object allocation을 줄일 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>SIMD</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Single Instruction, Multiple Data. 한 명령으로 여러 숫자 lane을 처리하는 CPU 기능이다. 연속되고 같은 type인 vector가 활용하기 쉽다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Late materialization</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Predicate 열을 먼저 읽어 통과 row 위치를 selection vector로 만든 뒤, 필요한 나머지 열을 늦게 조합하는 기법이다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>1억 행, 평균 행 폭 200B인 table은 raw 기준 약 20GB다. Query가 8B amount와 8B timestamp만 필요하다면 projection byte는 행당 16B, 총 1.6GB다. 압축·metadata·request 비용 전의 단순 모델만으로도 row scan은 필요한 byte의 약 12.5배를 옮길 수 있다. 컬럼형은 16B에 가까운 연속 영역만 요청할 가능성을 만든다.</p>
+<p>하지만 “Parquet라서 12.5배 빠르다”는 결론은 틀리다. Predicate로 row group을 skip했는지, object storage range request가 몇 번인지, compression codec의 CPU 비용, cache hit, decode vector 폭, projected 열 수, output cardinality가 합쳐져 wall time이 된다. 면접과 실무에서는 format 이름이 아니라 <strong>bytes read → requests → decode CPU → materialization → output</strong>을 설명해야 한다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>오늘의 비용식:</strong> 대략적인 scan 비용은 <code>T ≈ request latency × request count + bytes read / effective bandwidth + decode CPU + operator CPU + materialization</code>이다. 이 식은 예측 모델이며 실제 engine profile로 각 항을 검증해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 selective read 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① SQL planner</strong><br><code>SELECT region, SUM(amount) WHERE day=...</code><br>Projection·predicate·aggregate를 physical plan으로 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ control: 필요한 열·filter·snapshot 전달</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Footer / tail read</strong><br>Schema, row group·stripe 위치, column metadata와 statistics를 읽는다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ control: skip 가능한 단위와 byte range 결정</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Storage range reads</strong><br>선택된 row group의 day·region·amount column chunks만 요청한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ data: compressed page bytes</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Decompress + decode</strong><br>Definition level·dictionary·encoded value를 typed vector와 validity로 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ data: vector batch + row positions</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Predicate + selection vector</strong><br>day 조건을 통과한 row index만 남긴다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ late materialize: 같은 위치의 region·amount</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>⑥ Aggregate / output</strong><br>Vector batch를 group·sum하고 결과가 완성된 뒤 query success를 확정한다.</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Data path:</strong> object byte ranges → compressed pages → decoded typed vectors → selection vector → aggregate state → result.<br><strong>Control path:</strong> SQL plan → snapshot/schema → metadata → pruning decision → projection → memory budget·retry·cancellation을 전달한다.</div>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">소유자와 불변식</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Physical metadata</strong></td><td style="padding:8px;border:1px solid #d9e6df;">File writer가 footer/tail을 소유한다. Offset·length·codec·schema가 실제 byte와 일치해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Snapshot</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Catalog/table layer가 file set을 소유한다. Query 전체가 같은 committed snapshot을 봐야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Selection vector</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Execution operator가 batch-local row positions를 소유한다. 모든 projected column이 같은 logical row ordering을 유지해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Aggregate state</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Query task가 partial state를 소유한다. Retry가 같은 partial을 중복 merge하지 않아야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Success</strong></td><td style="padding:8px;border:1px solid #d9e6df;">모든 required ranges가 checksum·decode·operator를 통과하고 coordinator가 결과 또는 committed output을 확정할 때다. Range read 하나의 200 응답은 query success가 아니다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Cache line과 spatial locality</h3>
+<p>예시로 64B cache line과 64B fixed row를 가정하자. amount가 8B여도 row layout에서는 다음 amount가 64B 뒤에 있어 cache line마다 필요한 byte가 8B뿐일 수 있다. 유효 사용률은 8/64=12.5%다. Amount column이 연속이면 한 cache line에 8개의 amount가 들어가므로 scan loop가 가져온 byte 대부분을 계산에 쓴다. 실제 CPU prefetcher·cache hierarchy·alignment는 machine마다 다르므로 profile로 확인한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Compression은 locality의 2차 효과다</h3>
+<p>같은 type과 비슷한 값이 모이면 dictionary, run-length encoding, delta, bit packing과 일반 compression이 반복 패턴을 더 쉽게 찾는다. Row layout에서 status·timestamp·문자열이 교차하면 entropy model의 locality가 약해질 수 있다. 다만 high-cardinality encrypted value나 이미 압축된 blob은 columnar만으로 크게 줄지 않으며 codec CPU가 I/O 절감보다 비쌀 수도 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Vector batch·branch·SIMD</h3>
+<p>Typed column vector는 매 row마다 type tag를 확인하고 object를 만드는 일을 줄인다. Null은 validity bitmap, 조건 통과 위치는 selection vector로 분리할 수 있다. 동일 연산을 batch loop에 적용하면 branch prediction이 쉬워지고 compiler·runtime이 SIMD를 쓰기 좋아진다. 그러나 variable-length string, nested value, 높은 null branching, UDF는 이 경로를 깨뜨릴 수 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Storage request와 failure window</h3>
+<p>Local disk의 sequential read와 object storage의 여러 range GET은 같은 “1GB read”가 아니다. 너무 작은 page·column chunk·file은 request count와 TLS·queue·metadata overhead를 늘린다. 반대로 row group이 너무 크면 writer memory, retry 범위, tail latency가 커지고 pruning granularity가 거칠어진다. Parquet 공식 configuration의 큰 row group 권고는 HDFS 맥락의 출발점이지 모든 engine·object store에 고정 적용할 정답이 아니다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Row와 column의 비용 경계</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Workload</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">유리한 locality와 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>넓은 scan, 좁은 projection</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Columnar. 필요한 열 range·decode만 수행하고 compression·vectorization을 활용한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Primary key point lookup, 모든 field</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Row/indexed store. 한 위치에서 행 전체를 가져오며 여러 column range를 조합하지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>한 행씩 잦은 update</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Row/LSM 계층이 보통 적합하다. Immutable columnar file을 매 update마다 rewrite하지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>대규모 aggregate</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Columnar. Type-homogeneous vector와 작은 projected bytes가 강점이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>거의 모든 열 SELECT *</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Columnar 이득이 줄고 decompression·materialization·range count가 우세할 수 있다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:28%;">판단 축</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">질문·지표·결정</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Projection</strong></td><td style="padding:8px;border:1px solid #d9e6df;">P50/P95 projected column 수와 projected bytes/row width를 측정한다. Narrow projection 비중이 높으면 columnar 가치가 크다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Skipping</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Files listed, row groups considered/skipped, bytes requested/read를 분리한다. Partition·sort/clustering과 statistics가 실제 predicate와 맞는지 본다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Granularity</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Row group·stripe·file 크기를 memory budget, parallelism, retry unit, request latency, pruning 정밀도와 함께 조정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>CPU</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Decompress/decode ns/value, vectorized ratio, branch miss, allocation, UDF fallback을 profile한다. Bytes 감소만으로 CPU 개선을 가정하지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Write path</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Small batch를 바로 파일로 확정하지 말고 target size까지 buffer/compact한다. Partial file은 manifest/snapshot에 노출하지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>SLO</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Scan throughput뿐 아니라 P95 startup latency, memory, spill, request count, failure retry bytes와 비용까지 부하 테스트한다.</td></tr>
+</table>
+<h3 style="font-size:18px;color:#126246;">Best practice·anti-pattern·engine 차이</h3>
+<ul style="padding-left:22px;"><li><strong>Best:</strong> Query log에서 projection·predicate·scan bytes 분포를 먼저 구하고 file layout을 결정한다.</li><li><strong>Best:</strong> <code>bytes read / projected logical bytes</code>, skipped row groups, range request count를 함께 관측한다.</li><li><strong>Best:</strong> Row group·stripe를 독립 recovery/parallelism 단위로 보고 writer memory와 retry cost를 제한한다.</li><li><strong>Best:</strong> Frequently filtered column의 clustering·statistics 품질을 검증하고 null·NaN·truncated statistics edge case를 fixture로 둔다.</li><li><strong>Anti-pattern:</strong> “Parquet면 빠름”만 믿고 <code>SELECT *</code>, 수 KB small files, UDF로 pushdown을 무력화한다.</li><li><strong>Anti-pattern:</strong> Compression ratio만 최대화하려고 거대한 block을 만들고 latency·memory·pruning을 희생한다.</li><li><strong>Anti-pattern:</strong> Writer가 footer까지 완성하기 전에 catalog에 file path를 공개한다.</li><li><strong>Edge:</strong> High-cardinality string·encrypted payload·already-compressed blob은 dictionary·codec 효과가 제한적이다.</li><li><strong>Engine:</strong> Page index·bloom·vectorized nested decode·predicate pushdown 지원은 engine와 version마다 다르다. Explain plan과 scan profile로 확인한다.</li><li><strong>Object store:</strong> 동일 byte라도 range GET 수가 많으면 latency·request charge가 커진다. Coalescing·prefetch 효과를 측정한다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Columnar 전환 뒤 query P95 악화, scan bytes·range GET·CPU·spill 급증, 특정 predicate만 느림, OOM, partial result·checksum/decode error, small-file listing 지연.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Query ID와 plan, snapshot/file list, projected columns, predicate pushdown, files/row groups considered·skipped, bytes requested/read, request count·latency, codec/decode CPU, batch size, memory/spill, footer·offset·checksum, engine build와 before baseline.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Wide projection, pushdown/UDF failure, poor clustering·statistics, row group 과대/과소, small files, range fragmentation, cold cache, expensive codec, scalar fallback, high-cardinality dictionary thrash, corrupt footer/page, partial publish.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Write/publish 확대를 중단하고 affected snapshot을 고정한다. 대표 query 한 개를 baseline과 동일 cache 조건에서 재현해 bytes·requests·CPU 항을 분리한다. Corrupt/partial files는 manifest에서 격리하되 원본 bytes를 보존한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good snapshot/file set으로 atomic pointer를 되돌린다. Bad files를 quarantine하고 committed source로 target size·sort·codec에 맞춰 idempotent rewrite한다. Count·min/max·checksum·business aggregate를 대사한 뒤 새 snapshot을 publish한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Evidence 없이 cache만 비우기, object를 제자리 overwrite, footer byte 수동 수정, corrupt row skip 후 성공 처리, 모든 query에 무조건 larger block 적용, unrelated files까지 bulk compaction, partial output을 committed snapshot에 섞지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: 같은 table의 row/column byte locality 측정</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리로 64B fixed row와 분리된 amount/status column을 만들고, 좁은 projection의 물리 byte·compression·scan time을 비교한다. 이는 교육용 memory model이며 Parquet benchmark가 아니다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상, 여유 memory 약 40MB. 외부 package와 파일 생성은 없다.</p>
+<p><strong>실행 전 예측:</strong> 20만 행에서 amount 8B와 status 1B만 읽을 때 row layout 12.8MB와 column layout 1.8MB의 비율, 결과 합계의 동일성, full projection과 point lookup에서 이득이 왜 줄어드는지 먼저 적는다.</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+import struct, time, zlib
+from array import array
+
+N = 200_000
+ROW = struct.Struct("&lt;QQqB31s8x")  # 64 bytes
+rows = bytearray(ROW.size * N)
+amounts = array("q")
+statuses = bytearray(N)
+payload = b"A" * 31
+
+for i in range(N):
+    amount = (i % 10_000) - 5_000
+    status = 1 if i % 4 == 0 else 0
+    ROW.pack_into(rows, i * ROW.size, i, 1_700_000_000 + i,
+                  amount, status, payload)
+    amounts.append(amount)
+    statuses[i] = status
+
+def row_query():
+    total = 0
+    for off in range(0, len(rows), ROW.size):
+        _, _, amount, status, _ = ROW.unpack_from(rows, off)
+        if status == 1:
+            total += amount
+    return total
+
+def col_query():
+    total = 0
+    for amount, status in zip(amounts, statuses):
+        if status == 1:
+            total += amount
+    return total
+
+def timed(fn):
+    best = float("inf")
+    result = None
+    for _ in range(3):
+        start = time.perf_counter()
+        result = fn()
+        best = min(best, time.perf_counter() - start)
+    return result, best
+
+row_bytes = len(rows)
+projected_bytes = len(amounts) * amounts.itemsize + len(statuses)
+rr, rt = timed(row_query)
+cr, ct = timed(col_query)
+amount_bytes = amounts.tobytes()
+column_streams = amount_bytes + bytes(statuses)
+
+print("row_size=", ROW.size, "rows=", N)
+print("row_scan_bytes=", row_bytes)
+print("column_projected_bytes=", projected_bytes)
+print("io_amplification_model=", round(row_bytes/projected_bytes, 2))
+print("same_result=", rr == cr, "result=", rr)
+print("best_seconds_row_col=", round(rt, 4), round(ct, 4))
+print("compressed_row_col=", len(zlib.compress(rows, 6)),
+      len(zlib.compress(column_streams, 6)))
+
+# 실패 주입: SELECT * 또는 한 행 point lookup 비용 모델
+full_projection = ROW.size * N
+point_row_ranges = 1
+point_column_ranges = 5
+request_ms = 8
+print("full_projection_ratio=", full_projection/row_bytes)
+print("point_lookup_request_ms_row_col=",
+      point_row_ranges*request_ms, point_column_ranges*request_ms)
+assert rr == cr
+assert row_bytes == 12_800_000
+assert projected_bytes == 1_800_000
+PY</code></div>
+<p><strong>예상 관찰:</strong> 논리 결과는 같고 byte model은 12.8MB 대 1.8MB, 약 7.11배다. 시간과 compression 크기는 machine·Python 구현에 따라 달라지므로 어느 쪽이 몇 배 빠르다고 일반화하지 않는다. 정확한 관찰은 layout과 bytes이며, 성능은 profile 결과다.</p>
+<h3 style="font-size:18px;color:#126246;">실패 주입·자주 나는 오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입 1:</strong> Query를 <code>SELECT *</code>로 바꾸면 projected bytes가 row width에 가까워져 I/O 이득이 사라진다.</li><li><strong>실패 주입 2:</strong> 한 row의 5개 열을 object store에서 각각 8ms range 요청한다고 가정하면 요청 대기만 40ms다. Row/index lookup 1회 8ms가 유리할 수 있다.</li><li><strong>오류:</strong> <code>array('q')</code> byte order·itemsize는 platform을 확인해야 portable wire format이 된다. 실무 file format은 명시적 endian/schema를 사용한다.</li><li><strong>오류:</strong> Python loop time을 SIMD/vectorized engine의 대리 지표로 쓰지 않는다. Bytes·result invariant만 일반화한다.</li><li><strong>오류:</strong> Compression 비교는 payload distribution에 의존한다. Random·null·high-cardinality fixture를 별도 추가한다.</li><li><strong>Cleanup:</strong> Memory object만 만들고 파일·package·container를 생성하지 않으므로 process 종료와 함께 정리된다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Columnar file도 row group·stripe 안에서 열을 나누며, 전역 한 열 파일이 아니다.</li><li>Projection selectivity와 predicate selectivity는 다르다.</li><li>Statistics는 row group을 skip할 뿐 통과 행의 exact index가 아닐 수 있다.</li><li>Bytes 감소와 wall time 감소를 같은 것으로 취급하지 않는다.</li><li>Small files는 metadata·listing·request amplification을 만든다.</li><li>거대한 row group은 pruning·retry·writer memory를 악화할 수 있다.</li><li>Point lookup·한 행 update에는 row layout이 더 자연스러울 수 있다.</li><li>Nested/string/UDF는 scalar fallback과 materialization 비용을 만들 수 있다.</li><li>Footer가 존재해도 partial object·wrong offset·checksum failure는 별도 검증이 필요하다.</li><li>Cache-warm benchmark 하나로 production P95를 결정하지 않는다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. 왜 columnar format이 OLAP에 유리한지 CPU와 storage까지 설명하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> OLAP의 scan·narrow projection을 정의한다 → row width W와 projected P로 bytes를 계산한다 → range read·compression·cache line·typed vector·SIMD 경로를 잇는다 → metadata pruning과 late materialization을 설명한다 → point lookup·wide projection·request overhead라는 반례를 제시한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. 100M행×200B table에서 16B만 투영합니다. 20GB와 1.6GB 계산만으로 성능을 확정할 수 있나요?</h3>
+<p><strong>좋은 답변 구조:</strong> 계산을 lower-bound model로 제시한다 → compression, row-group skipping, request count·bandwidth, decode/operator CPU, output cardinality를 추가한다 → cache condition과 concurrency를 통제한 benchmark를 설계한다 → plan/profile의 bytes·requests·CPU·spill 증거로 결론을 갱신한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Parquet 전환 후 P95가 3배 느려졌습니다. 어떻게 진단하고 안전하게 복구합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Snapshot과 대표 query를 고정한다 → projection/pushdown/skipping/file size/range GET/decode CPU/spill 증거를 수집한다 → small file·wide projection·scalar fallback·poor clustering 가설을 비용 항별로 검증한다 → publish 중단·last-known-good snapshot rollback → quarantine/rewrite/reconcile 후 단계적 재발행을 설명한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Protobuf binary·ProtoJSON·Avro에서 field rename의 identity 규칙은 각각 무엇인가?</li><li>같은 field number와 wire type을 다른 의미로 reuse하면 왜 parser success가 사고를 숨기는가?</li><li>Schema 변경 rollback을 code downgrade가 아니라 state transition으로 설명하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>64B row에서 8B amount만 scan할 때 row와 column cache-line locality를 비교하라.</li><li>Selective columnar query의 control path와 data path를 순서대로 설명하라.</li><li>Columnar가 point lookup과 wide projection에서 불리할 수 있는 이유를 비용식으로 설명하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Protobuf binary는 number, ProtoJSON은 name mapping, Avro resolution은 exact writer schema와 reader name/alias다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">유효 tag와 payload라 decode가 성공하지만 old value가 새 semantic으로 commit되어 registry/parser metric이 0일 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">새 writer bytes를 old reader가 안전하게 읽는 forward edge, checkpoint·sink state·quarantine·replay까지 되돌릴 수 있어야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Row는 cache line당 8B만 유효할 수 있고 column은 8개 amount를 연속 사용한다. 64B는 예시이며 실제 hardware를 확인한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Control은 plan→footer/tail→pruning→ranges·budget, data는 compressed pages→typed vectors→selection→late materialization→aggregate다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">P가 W에 가까우면 bytes 이득이 줄고, point lookup은 여러 column range의 request latency와 decode/materialization이 한 row/index read보다 클 수 있다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. Byte 수치, request·CPU 항, success invariant와 반례까지 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://parquet.apache.org/docs/file-format/" style="color:#126246;">Apache Parquet — File Format</a>: Row group 안에서 column chunk를 배치하고 metadata 뒤 관심 column chunk를 읽는 구조를 확인한다.</li><li><a href="https://parquet.apache.org/docs/file-format/configurations/" style="color:#126246;">Apache Parquet — Configurations</a>: Row group·page 크기의 sequential I/O, buffering, header/parse trade-off를 확인한다.</li><li><a href="https://parquet.apache.org/docs/file-format/data-pages/" style="color:#126246;">Apache Parquet — Data Pages</a>: Page header, repetition/definition level과 encoded value의 물리 순서를 확인한다.</li><li><a href="https://orc.apache.org/specification/ORCv1/" style="color:#126246;">Apache ORC — ORC v1 Specification</a>: Stripe·column stream·projection·index/statistics 기반 row-set skipping을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">공식 size 권고도 storage·engine 맥락에 따른 시작점이다. 실제 runtime의 vectorization·page index·bloom 지원은 해당 version 문서와 explain/profile로 검증한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 4 · Day 23 — Parquet row group·column chunk·page</strong><br>오늘의 locality가 Parquet의 3단 물리 계층에서 어떤 offset·metadata·compression·parallelism 단위로 구현되는지 byte map으로 해부한다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · count the bytes, count the requests, then explain the CPU</td></tr>
+</table></td></tr></table></body></html>

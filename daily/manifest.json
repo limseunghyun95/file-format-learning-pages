@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-24T09:00:28+09:00",
+  "updatedAt": "2026-08-25T09:10:42+09:00",
   "lessons": [
     {
       "day": 1,
@@ -194,6 +194,15 @@
       "path": "day-21.html",
       "kind": "review",
       "publishedAt": "2026-08-24T09:00:28+09:00"
+    },
+    {
+      "day": 22,
+      "week": 4,
+      "title": "columnar locality와 OLAP workload",
+      "summary": "Row와 column byte locality를 projection·cache line·range request·compression·vector batch 비용으로 계산하고 OLAP 이득과 point lookup 반례, 장애 복구를 학습합니다.",
+      "path": "day-22.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-25T09:10:42+09:00"
     }
   ]
 }
