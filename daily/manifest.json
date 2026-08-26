@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-25T09:10:42+09:00",
+  "updatedAt": "2026-08-26T09:01:21+09:00",
   "lessons": [
     {
       "day": 1,
@@ -203,6 +203,15 @@
       "path": "day-22.html",
       "kind": "lesson",
       "publishedAt": "2026-08-25T09:10:42+09:00"
+    },
+    {
+      "day": 23,
+      "week": 4,
+      "title": "Parquet row group·column chunk·page",
+      "summary": "Parquet의 file→row group→column chunk→page 계층을 offset·range read·encoding/compression 단위와 연결하고 footer·page 손상 반경과 atomic publish 복구를 학습합니다.",
+      "path": "day-23.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-26T09:01:21+09:00"
     }
   ]
 }
