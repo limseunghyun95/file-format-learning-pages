@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 24</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 4 / DAY 24 · LESSON</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">footer, schema, offset, statistics</h1><div style="font-size:15px;color:#d8eee5;">Parquet control plane과 safe pruning을 불변식으로 설계 · 예상 학습 65분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>Parquet footer는 schema와 모든 row group·column chunk의 위치·크기·통계를 담는 <strong>탐색 control plane</strong>이다. Reader는 footer를 신뢰하기 전에 object identity와 offset 경계를 검증하고, statistics가 predicate와 겹치지 않는다는 것이 확실할 때만 data를 skip해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>FileMetaData</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Footer의 핵심 Thrift 구조다. Format version, schema tree, row count, row groups, key-value metadata, column orders 등을 담는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>SchemaElement</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Parquet schema tree의 node다. Group은 child 수를, primitive leaf는 physical type과 repetition·logical annotation 등을 표현한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Physical type</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Disk encoding을 결정하는 최소 primitive type이다. 예: INT32, INT64, BYTE_ARRAY. Application 의미와 같지 않다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Logical type</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Primitive bytes를 STRING, DECIMAL, DATE, TIMESTAMP 같은 의미로 해석하게 하는 annotation이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Column path</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Root에서 primitive leaf까지의 이름 경로다. Column chunk metadata를 schema leaf와 연결한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Offset / length</strong></td><td style="padding:9px;border:1px solid #d9e6df;">파일 시작 기준 byte 위치와 읽을 byte 수다. 범위는 보통 half-open interval <code>[offset, offset+length)</code>로 계산한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Statistics</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Column chunk/page의 lower·upper bound, null count 등 optional metadata다. 원본 value 목록이 아니라 skip 가능성을 판단하는 summary다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Column order</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Min/max bytes를 어떤 순서 규칙으로 비교할지 정의한다. Physical bytes만 사전식 비교하면 signed number·decimal·logical type에서 틀릴 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Zone map</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Data block별 min/max를 저장해 predicate와 범위가 겹치지 않을 때 block을 skip하는 index 방식이다. Parquet statistics가 비슷한 역할을 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Predicate pruning</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Query 조건으로 result가 절대 나올 수 없는 file/row group/page를 decode 전에 제외하는 최적화다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>False skip</strong></td><td style="padding:9px;border:1px solid #d9e6df;">실제 matching row가 있는데 잘못된 metadata·비교로 block을 제외하는 정합성 장애다. 느린 query보다 훨씬 위험하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>ETag / object version</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Object의 특정 immutable content를 식별하는 storage metadata다. Footer cache와 data range가 같은 object임을 묶는 데 사용한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>1TB table에서 predicate가 단 한 row group만 필요하다면 footer 수십~수백 KB를 읽어 수백 GB data I/O를 피할 수 있다. 그러나 statistics를 잘못 해석해 필요한 group까지 skip하면 query는 빠르게 <strong>틀린 답</strong>을 낸다. 따라서 pruning의 기본 정책은 “통계가 없거나 불확실하면 읽는다”다.</p>
+<p>Schema도 단순 column 이름 목록이 아니다. <code>INT64</code>는 signed integer일 수도 있고 TIMESTAMP·DECIMAL의 physical carrier일 수도 있다. Logical annotation, precision·scale, timezone adjustment, repetition과 column order를 함께 해석해야 bytes와 statistics가 같은 의미를 갖는다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>안전성 규칙:</strong> Pruning은 <code>may_match = false</code>를 증명할 때만 수행한다. Metadata absent·unsupported·corrupt·ambiguous이면 <code>may_match = true</code>로 두고 data를 읽는다. False positive read는 성능 비용이지만 false negative skip은 결과 정합성 장애다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Snapshot + object identity</strong><br>Path, version/ETag, size <code>S</code>를 고정한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ read tail 8B, validate <code>PAR1</code></td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Footer range</strong><br><code>F = S - 8 - footer_len</code>, 범위 <code>[F,S-8)</code>를 읽는다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ Thrift Compact decode + bounds checks</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Schema binding</strong><br>Physical type + logical type + repetition + column path + order를 묶는다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ typed predicate normalize</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Row-group pruning</strong><br>Min/max/null_count가 predicate와 절대 겹치지 않는 group만 skip한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ optional page index: ColumnIndex + OffsetIndex</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Range planner</strong><br>Projected chunks/pages의 offset·length를 검증하고 정렬·coalesce한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ data bytes + actual predicate</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>⑥ Decode and verify</strong><br>Page decode 후 predicate를 실제 values에 적용해 result를 만든다.</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Control path:</strong> Snapshot → footer → schema/order → statistics → pruning → range plan.<br><strong>Data path:</strong> Selected ranges → page bytes → typed vectors → actual predicate → output. Statistics는 data path를 대체하지 않고 읽을 범위를 줄인다.</div>
+
+<h3 style="font-size:18px;color:#126246;">Pruning 판단표</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Predicate</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">안전하게 skip 가능한 조건</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>x = v</code></td><td style="padding:8px;border:1px solid #d9e6df;"><code>v &lt; lower</code> 또는 <code>v &gt; upper</code>. Bound·order가 유효해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>x &gt; v</code></td><td style="padding:8px;border:1px solid #d9e6df;"><code>upper &lt;= v</code>.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>x &gt;= v</code></td><td style="padding:8px;border:1px solid #d9e6df;"><code>upper &lt; v</code>.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>x IS NULL</code></td><td style="padding:8px;border:1px solid #d9e6df;"><code>null_count == 0</code>이 명시적으로 존재할 때. Field absent를 0으로 간주하지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><code>x IS NOT NULL</code></td><td style="padding:8px;border:1px solid #d9e6df;">명시적 <code>null_count == row_count</code>일 때.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Stats 없음/불신</td><td style="padding:8px;border:1px solid #d9e6df;"><strong>Skip 금지.</strong> Read/decode 후 실제 predicate를 적용한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Footer는 늦게 쓰이는 control plane</h3>
+<p>Writer는 data pages를 한 번 순차로 쓰면서 offset·size·count·statistics를 누적하고 마지막에 FileMetaData를 직렬화한다. 그래서 single-pass write가 가능하지만 crash가 footer write 전에 발생하면 앞의 data bytes가 있어도 일반 reader가 탐색 지도를 얻지 못한다. Catalog publish는 footer durable/reopen 뒤에 와야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Schema tree와 byte 의미</h3>
+<p>FileMetaData의 schema는 depth-first SchemaElement 목록으로 tree를 표현한다. Group node의 child 수로 subtree를 복원하고 primitive leaf를 column path에 연결한다. Reader는 physical type만으로 application value를 만들지 않는다. 예를 들어 DECIMAL은 unscaled integer와 scale, TIMESTAMP는 unit과 UTC adjustment 의미가 필요하다. Legacy ConvertedType과 LogicalType annotation의 호환 해석도 reader/version matrix에 포함한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Offset arithmetic와 integer safety</h3>
+<p>각 range는 <code>0 &lt;= start</code>, <code>0 &lt;= length</code>, <code>start &lt;= file_size</code>, <code>length &lt;= file_size-start</code>로 검증한다. 먼저 <code>start+length</code>를 계산하면 fixed-width integer overflow로 작은 양수가 될 수 있다. Data ranges는 footer와 의도치 않게 겹치지 않는지도 본다. External column file reference가 있으면 그 file identity와 size에 대해 별도 검증한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Statistics는 exact min/max가 아니라 보수적 bound일 수 있다</h3>
+<p>Variable-length value의 bounds는 index 크기를 제한하려고 실제 존재하지 않는 더 짧은 lower/upper bound로 넓힐 수 있다. 예를 들어 page의 문자열 max를 full string 대신 더 큰 prefix upper bound로 저장할 수 있다. 핵심 불변식은 모든 non-null value가 <code>[lower, upper]</code> 안에 있어야 한다는 것이다. Bound를 안쪽으로 자르면 false skip이 생긴다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Sort order·NaN·signed zero</h3>
+<p>Statistics bytes는 schema의 column order로 비교해야 한다. Signed integer를 unsigned byte order로 비교하거나 DECIMAL scale을 무시하면 범위가 뒤집힌다. FLOAT/DOUBLE의 NaN과 <code>-0.0/+0.0</code>은 ordering edge case다. Writer/runtime generation이 불명확하거나 reader가 해당 semantics를 지원하지 않으면 min/max pruning을 비활성화하고 실제 값을 읽는 것이 안전하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 ColumnIndex와 OffsetIndex의 협업</h3>
+<p>Optional page index의 ColumnIndex는 page별 value bounds로 predicate 대상 page를 찾고, OffsetIndex는 page 위치·row index를 통해 다른 projected columns의 대응 rows를 찾게 한다. Index는 footer 근처에 별도 저장될 수 있어 selective scan이 아니면 읽지 않아도 된다. 지원하지 않는 reader는 성능 최적화를 놓칠 뿐 data page를 정상 decode할 수 있어야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">소유자와 불변식</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer/footer가 physical·logical type과 column paths를 소유한다. 모든 chunk path가 정확히 한 compatible leaf에 결합돼야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Offsets</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Footer metadata가 ranges를 소유한다. 같은 immutable object version 안의 유효 경계여야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Statistics</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer가 계산한다. 모든 value를 포괄하는 correct order bounds여야 하며 absent와 zero를 구분한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Pruning</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Reader/planner가 소유한다. Skip은 no-match가 증명될 때만 허용된다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Success</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer는 reopen+metadata/range/count 검증 후 snapshot commit, reader는 selected data에 실제 predicate를 적용해 결과를 완성할 때 성공이다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:28%;">판단 축</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">실무 기준과 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Footer cache key</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Path 단독이 아니라 object version/ETag+size+encryption context를 사용한다. Overwrite 뒤 stale offsets가 새 data를 읽는 것을 막는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Stats trust</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer build, logical type, order, min/max presence, known bad generations를 기반으로 column별 pruning enable/disable 정책을 둔다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema compatibility</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Name/path뿐 아니라 field ID 사용, physical/logical type, decimal precision/scale, timestamp unit, nullability를 engine matrix로 검증한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Offset validation</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Footer parse 직후 모든 ranges를 bounded arithmetic으로 검사한다. On-demand read 때까지 corrupt offset 발견을 미루지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Files/groups/pages considered·pruned, reason, stats absent/invalid, bytes avoided/read, footer cache hit와 false-positive read를 기록한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Audit</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Sample file을 full scan해 실제 min/max/null count와 footer를 대조한다. High-risk amount/time/ID column은 generation별 fixture를 유지한다.</td></tr>
+</table>
+<h3 style="font-size:18px;color:#126246;">Best practice·anti-pattern·edge case·version 차이</h3>
+<ul style="padding-left:22px;"><li><strong>Best:</strong> Stats가 없으면 read, 틀렸다고 알려진 writer generation은 pruning off로 격리한다.</li><li><strong>Best:</strong> Pruning decision log에 file version, column path, predicate, lower/upper/null count와 reason code를 남긴다.</li><li><strong>Best:</strong> Schema와 predicate를 같은 logical domain으로 normalize한 뒤 compare한다. Timestamp unit·timezone, decimal scale을 먼저 맞춘다.</li><li><strong>Best:</strong> Canaries에서 pruning on/off 결과 hash·count·aggregate를 비교해 false skip을 탐지한다.</li><li><strong>Anti-pattern:</strong> Null count field absent를 0으로 취급한다.</li><li><strong>Anti-pattern:</strong> Raw min/max bytes를 unsigned lexicographic order로 모든 type에 적용한다.</li><li><strong>Anti-pattern:</strong> Path만 key로 footer를 영구 cache하면서 object overwrite를 허용한다.</li><li><strong>Edge:</strong> All-null, empty row group, NaN-only, signed zero, very long UTF-8, invalid UTF-8 physical bytes, decimal negative, local timestamp를 fixture로 둔다.</li><li><strong>Edge:</strong> Truncated string bound는 반드시 바깥쪽으로 넓어야 한다. 안쪽 truncation은 false skip이다.</li><li><strong>Version:</strong> LogicalType/legacy ConvertedType, page index와 최신 statistics semantics 지원은 engine/version마다 다르므로 공식 implementation status와 실제 matrix를 함께 본다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Pruning on/off 결과 count·sum 불일치, 특정 날짜/음수/NaN 누락, range 416·EOF, schema cast error, decimal/timestamp 값 변형, footer cache hit 뒤 decode failure, query는 빠르지만 결과가 비어 있음.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Query/predicate normalized form, snapshot·path·version/ETag·size, raw footer checksum, schema elements/logical annotations/column order, row-group and page bounds/null counts, offset+length, prune reason, writer/reader build, full-scan baseline와 affected IDs.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Wrong/stale footer, object overwrite, offset overflow, corrupt/truncated bounds, wrong sort order, absent null_count→0, NaN/signed-zero bug, logical type/unit mismatch, legacy stats bug, page/row-group index misalignment, unsafe cast pushdown.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Affected column/writer generation의 pruning을 끄고 full read로 correctness를 우선 복구한다. Snapshot과 object version을 고정하고 raw footer·ranges를 보존한다. Pruning on/off shadow query로 최소 반례를 찾는다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">Rollback / 복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good reader/policy 또는 snapshot으로 rollback한다. Committed source에서 correct schema/order/stats로 immutable files를 rewrite한다. Full scan count·min/max/null·business aggregate를 대사한 뒤 atomic snapshot으로 교체하고 bad generation을 quarantine한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">틀린 stats를 수동 patch, object 제자리 overwrite, missing을 zero로 보정, failed range skip 후 query 성공, cache만 무차별 삭제, latest schema 추측, 결과 누락 상태로 checkpoint/aggregate publish, 원본 evidence 삭제를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: safe pruning과 offset validator</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리만으로 row-group zone map을 평가한다. Missing/untrusted stats는 read하는 보수적 정책, null_count absent와 zero의 차이, corrupt max가 false skip을 만드는 사고, overflow-safe offset 검사를 재현한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package·파일·Docker가 필요 없다.</p>
+<p><strong>실행 전 예측:</strong> <code>amount &gt; 100</code>에서 max=90인 RG, stats 없는 RG, 실제 150이 있지만 잘못된 max=80인 RG는 각각 READ/SKIP 중 무엇인가? Correctness를 지키려면 어떤 metadata를 불신해야 하는가?</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+UNKNOWN = object()
+
+def may_match(stats, op, value=UNKNOWN):
+    # Unknown/unsupported metadata must never cause a skip.
+    if not stats or not stats.get("trusted", False):
+        return True, "READ_UNTRUSTED_OR_MISSING"
+    lo = stats.get("min", UNKNOWN)
+    hi = stats.get("max", UNKNOWN)
+    nulls = stats.get("null_count", UNKNOWN)
+    rows = stats["row_count"]
+    if op == "IS_NULL":
+        return ((nulls is UNKNOWN or nulls &gt; 0),
+                "READ_NULL_POSSIBLE" if nulls is UNKNOWN or nulls &gt; 0
+                else "SKIP_NULL_COUNT_ZERO")
+    if op == "IS_NOT_NULL":
+        return ((nulls is UNKNOWN or nulls &lt; rows),
+                "READ_NON_NULL_POSSIBLE" if nulls is UNKNOWN or nulls &lt; rows
+                else "SKIP_ALL_NULL")
+    if lo is UNKNOWN or hi is UNKNOWN:
+        return True, "READ_NO_BOUNDS"
+    if op == "EQ":
+        keep = lo &lt;= value &lt;= hi
+    elif op == "GT":
+        keep = hi &gt; value
+    elif op == "GE":
+        keep = hi &gt;= value
+    else:
+        return True, "READ_UNSUPPORTED_OP"
+    return keep, "READ_RANGE_OVERLAP" if keep else "SKIP_DISJOINT"
+
+groups = [
+  {"id":"RG0", "values":[10,20,90],
+   "stats":{"trusted":True,"min":10,"max":90,
+            "null_count":0,"row_count":3}},
+  {"id":"RG1", "values":[110,150,None],
+   "stats":{"trusted":True,"min":110,"max":150,
+            "null_count":1,"row_count":3}},
+  {"id":"RG2", "values":[120,130], "stats":None},
+  # Failure injection: actual 150 lies outside the corrupt max=80.
+  {"id":"BAD", "values":[50,150],
+   "stats":{"trusted":True,"min":50,"max":80,
+            "null_count":0,"row_count":2}},
+]
+
+expected=[]; pruned=[]
+for g in groups:
+    expected += [v for v in g["values"] if v is not None and v &gt; 100]
+    keep, reason = may_match(g["stats"], "GT", 100)
+    print(g["id"], "READ" if keep else "SKIP", reason)
+    if keep:
+        pruned += [v for v in g["values"] if v is not None and v &gt; 100]
+print("full_scan=", expected)
+print("trusted_pruning_result=", pruned)
+print("false_skip_detected=", expected != pruned)
+
+# Quarantine the known-bad writer generation: untrusted means READ.
+groups[-1]["stats"]["trusted"] = False
+recovered=[]
+for g in groups:
+    keep,_ = may_match(g["stats"], "GT", 100)
+    if keep:
+        recovered += [v for v in g["values"] if v is not None and v &gt; 100]
+print("recovered_equal=", recovered == expected)
+
+def valid_range(start, length, file_size, footer_start):
+    # Avoid start+length overflow: compare length with limit-start.
+    if min(start, length, file_size, footer_start) &lt; 0:
+        return False
+    if start &gt; footer_start:
+        return False
+    return length &lt;= footer_start - start
+
+for r in [(4,200,1000,900),(850,60,1000,900),
+          (890,20,1000,900),(-1,10,1000,900)]:
+    print("range", r[:2], "valid=", valid_range(*r))
+
+assert expected == [110,150,120,130,150]
+assert pruned != expected
+assert recovered == expected
+PY</code></div>
+<p><strong>예상 관찰:</strong> RG0는 max≤100이라 skip, RG1은 read, RG2는 stats가 없어 read한다. BAD는 잘못된 max 때문에 skip되어 full scan의 150 하나가 사라진다. 해당 generation을 untrusted로 바꾸면 read로 fallback해 결과가 복구된다. Offset은 footer 경계를 넘거나 음수면 거절된다.</p>
+<h3 style="font-size:18px;color:#126246;">실패 주입·오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입:</strong> BAD의 actual 150과 max 80 불변식 위반이 false skip을 만든다. Query latency·error metric은 정상일 수 있다.</li><li><strong>오류:</strong> Stats missing을 empty range로 간주하지 않는다. Unknown은 READ다.</li><li><strong>오류:</strong> <code>null_count</code>가 없을 때 0으로 default하지 않는다. <code>IS NULL</code>은 읽어야 한다.</li><li><strong>오류:</strong> Python integer는 overflow하지 않지만 Java/C++ fixed-width 구현은 <code>length &lt;= limit-start</code> 형태로 검증한다.</li><li><strong>확장:</strong> EQ·GE, all-null, decimal scale, UTF-8 bound, NaN fixture를 추가하고 pruning on/off result hash를 비교한다.</li><li><strong>Cleanup:</strong> Memory object만 사용하므로 파일·package·container가 남지 않는다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Footer cache는 path가 아니라 immutable object identity에 묶는다.</li><li>Physical type과 logical type을 분리한 뒤 함께 해석한다.</li><li>Statistics field는 optional이며 absent와 zero가 다르다.</li><li>Bounds는 exact value가 아니라 모든 value를 감싸는 보수적 범위일 수 있다.</li><li>Truncation은 범위를 바깥쪽으로 넓혀야 한다.</li><li>Column order 없는 raw byte comparison은 위험하다.</li><li>NaN·signed zero·legacy writer는 generation별 정책이 필요하다.</li><li>Offset 합 덧셈 전에 overflow-safe inequality를 쓴다.</li><li>Page index 미지원은 성능 저하이지 data 누락 이유가 되어서는 안 된다.</li><li>Pruning은 actual predicate를 대체하지 않는다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Parquet footer만으로 selective scan plan을 만드는 과정을 설명하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Object version/size를 고정한다 → tail 8B와 footer를 읽고 경계를 검증한다 → schema physical/logical type과 column order로 predicate를 normalize한다 → row-group stats로 safe prune한다 → projected chunk/page offsets를 coalesce한다 → bounded decode 후 실제 predicate를 적용한다 → bytes/prune reason/correctness canary를 측정한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Min/max statistics를 언제 믿지 않겠습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Missing·unsupported order·logical mismatch·known bad writer·NaN/legacy semantics·corrupt bounds를 열거한다 → unknown은 read라는 one-sided safety를 정의한다 → pruning on/off shadow 결과와 sampled full scan으로 trust를 검증한다 → column/generation별 disable과 rewrite 복구를 제안한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Pruning 이후 매출 합계가 작아졌지만 error는 없습니다. 대응하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Correctness incident로 선언하고 pruning off로 즉시 복구한다 → snapshot/object/footer/predicate/reason evidence를 고정한다 → on/off 최소 반례와 writer generation을 찾는다 → false bound/order/schema/cache 가설을 검증한다 → last-good rollback 또는 immutable rewrite → count·sum·IDs 대사 후 재활성화 gate를 설명한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Row group·column chunk·page는 각각 어떤 성능·복구 단위인가?</li><li>File size만 아는 reader가 projected chunk를 찾는 range 순서는?</li><li>Footer, page header, page body 손상의 failure radius는 왜 다른가?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li><code>x &gt; 100</code>, <code>x=42</code>, <code>x IS NULL</code>의 safe skip 조건을 말하라.</li><li>Physical type, logical type, column order가 statistics 비교에서 각각 왜 필요한가?</li><li>Stale footer cache와 corrupt offset이 만드는 장애 및 안전한 검증 순서를 설명하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Row group=task/pruning, chunk=contiguous projected I/O, page=encoding/compression·optional skipping 단위다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Tail 8B→footer range→metadata/schema→prune/project→chunk/page ranges→decode 순이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Footer는 전역 지도, page header는 다음 boundary, body는 payload를 소유해 손상 반경이 file/remaining chunk/page로 다르다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">각각 upper≤100, 42가 [lower,upper] 밖, 명시적 null_count=0일 때만 skip한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Physical은 byte carrier, logical은 의미/unit, order는 bound comparison 규칙을 제공한다. 셋이 맞아야 pruning이 안전하다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Cache를 version/ETag+size에 묶고 tail/footer checksum 뒤 모든 range를 overflow-safe하게 검증한 후에만 data를 요청한다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. One-sided correctness, schema/order, bounded offsets, evidence·rollback까지 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://parquet.apache.org/docs/file-format/metadata/" style="color:#126246;">Apache Parquet — Metadata</a>: FileMetaData가 offset·size를 제공하고 PageHeader가 inline decode metadata임을 확인한다.</li><li><a href="https://parquet.apache.org/docs/file-format/types/logicaltypes/" style="color:#126246;">Apache Parquet — Logical Types</a>: Physical carrier에 logical 의미·정렬 규칙을 부여하고 ConvertedType 호환을 다루는 규칙을 확인한다.</li><li><a href="https://github.com/apache/parquet-format/blob/master/PageIndex.md" style="color:#126246;">Apache Parquet Format — Page Index</a>: ColumnIndex·OffsetIndex, bounds truncation과 page skipping 설계를 확인한다.</li><li><a href="https://parquet.apache.org/docs/file-format/implementationstatus/" style="color:#126246;">Apache Parquet — Implementation Status</a>: Engine/version별 physical·logical type과 optional feature 지원을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">지원표는 시간에 따라 바뀐다. 실제 배포 reader/writer build에서 golden file과 pruning on/off result matrix를 실행하고, 확인하지 않은 version 동작은 단정하지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 4 · Day 25 — ORC stripe·row index·bloom filter</strong><br>Parquet의 footer·zone map과 비교해 ORC stripe footer, row index stride와 bloom filter가 negative lookup·range pruning을 어떻게 나누는지 분석한다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · metadata may optimize reads, but must never invent absence</td></tr>
+</table></td></tr></table></body></html>
