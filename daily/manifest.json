@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-27T09:00:32+09:00",
+  "updatedAt": "2026-08-28T09:08:49+09:00",
   "lessons": [
     {
       "day": 1,
@@ -221,6 +221,15 @@
       "path": "day-24.html",
       "kind": "lesson",
       "publishedAt": "2026-08-27T09:00:32+09:00"
+    },
+    {
+      "day": 25,
+      "week": 4,
+      "title": "ORC stripe·row index·bloom filter",
+      "summary": "ORC tail·stripe stream directory·row index positions와 bloom filter의 probabilistic contract를 연결하고 false negative, version mismatch와 안전한 pruning 복구를 학습합니다.",
+      "path": "day-25.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-28T09:08:49+09:00"
     }
   ]
 }

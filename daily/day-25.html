@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 25</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 4 / DAY 25 · LESSON</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">ORC stripe·row index·bloom filter</h1><div style="font-size:15px;color:#d8eee5;">Tail·stream directory·probabilistic pruning을 production read path로 연결 · 예상 학습 65분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>ORC는 독립 처리 단위인 <strong>stripe</strong> 안에 index streams·column data streams·stripe footer를 두고, writer가 정한 row index stride마다 statistics와 seek positions를 기록한다. Optional bloom filter는 equality 후보를 더 줄이지만 false positive는 허용하며, 정상 구현에서 false negative가 없어야만 “없음→skip”이 안전하다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>ORC</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Optimized Row Columnar. Type-aware columnar file format으로, file/stripe/row-group 통계와 column streams를 내장한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Stripe</strong></td><td style="padding:9px;border:1px solid #d9e6df;">전체 row를 경계 안에 담는 독립 body partition이다. Index section, data section, stripe footer로 구성되고 분산 task의 자연스러운 단위다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Stream</strong></td><td style="padding:9px;border:1px solid #d9e6df;">한 column을 역할별 byte sequence로 나눈 것이다. PRESENT, DATA, LENGTH, DICTIONARY_DATA, ROW_INDEX, BLOOM_FILTER 등이 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Stripe footer</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Stripe 안 각 stream의 kind·column id·length와 column encoding을 담는 directory다. Stream의 정확한 배치는 이 metadata가 진실의 원천이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>File tail</strong></td><td style="padding:9px;border:1px solid #d9e6df;">File metadata, footer, postscript와 마지막 postscript length byte를 묶은 끝부분이다. Schema·stripes·compression·통계 탐색의 시작점이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Postscript</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Footer/metadata 길이, compression, version 등 tail을 해석하는 작은 Protocol Buffers message다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Row index stride</strong></td><td style="padding:9px;border:1px solid #d9e6df;">RowIndexEntry 하나가 대표하는 최대 row 수다. 10,000은 널리 쓰이는 기본값이지만 file footer의 writer 설정이 실제 계약이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>RowIndexEntry</strong></td><td style="padding:9px;border:1px solid #d9e6df;">한 stride 범위의 column statistics와 해당 column streams에서 seek할 position vector를 담는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>SARG</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Search ARGument. Reader가 pushdown하기 쉽도록 단순화한 predicate expression이다. 예: <code>age &gt; 100</code>.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Bloom filter</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Bitset과 여러 hash로 set membership을 근사하는 자료구조다. 정상 조건에서 “없음”은 확정, “있을 수 있음”은 후보다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>False positive</strong></td><td style="padding:9px;border:1px solid #d9e6df;">실제 값이 없는데 bloom이 “있을 수 있음”이라고 답하는 경우다. 추가 read 비용은 생기지만 결과는 틀리지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>False negative</strong></td><td style="padding:9px;border:1px solid #d9e6df;">실제 값이 있는데 “없음”이라고 답하는 경우다. 정상 bloom에는 없어야 하며 발생하면 data 누락 장애다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>ORC reader가 <code>customer_id = 42</code>를 찾을 때 파일 전체를 바로 읽지 않는다. File/stripe statistics로 큰 범위를 제외하고, 남은 stripe의 row index statistics로 stride 범위를 좁힌 뒤, bloom filter가 “42는 절대 없음”이라고 답한 row group을 더 제외할 수 있다. 마지막 후보만 column streams에서 seek·decode한다.</p>
+<p>하지만 bloom은 database secondary index가 아니다. “maybe”는 위치도 존재도 확정하지 않으며 실제 data predicate가 필요하다. False positive rate를 낮추면 bitset과 index I/O가 커진다. Distinct가 낮거나 min/max만으로 충분한 column에 bloom을 무조건 켜면 storage·writer CPU·tail latency만 늘 수 있다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>안전성 규칙:</strong> Statistics와 bloom은 one-sided filter다. Metadata가 없거나 hash/version·encoding이 불명확하면 읽는다. 정상 bloom의 negative만 skip에 쓰고 positive는 반드시 실제 value로 검증한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① File tail read</strong><br>마지막 length byte → Postscript → Metadata/Footer를 읽고 compression·schema·stripes를 얻는다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ file/stripe statistics + SARG</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Stripe pruning</strong><br>Predicate와 겹칠 수 없는 stripes를 제외한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ selected StripeInformation offset·length</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Stripe footer read</strong><br>Stream kind·column id·length와 encoding으로 index/data range directory를 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ predicate columns의 ROW_INDEX/BLOOM_FILTER</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Row-group pruning</strong><br>Stride statistics 먼저, 남은 equality 후보에 bloom negative를 적용한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ position vector로 stream seek</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Projected stream ranges</strong><br>PRESENT·DATA·LENGTH·dictionary 등 필요한 column streams만 읽는다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ decompress → RLE/dictionary decode → vectors</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>⑥ Actual predicate + output</strong><br>Bloom “maybe” 후보를 실제 values로 검증하고 결과를 만든다.</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Control path:</strong> Snapshot → tail/footer → SARG → stripe footer → row index/bloom → stream seek plan.<br><strong>Data path:</strong> Selected stream ranges → decompressed stream state → typed vectors → actual predicate → result.</div>
+
+<h3 style="font-size:18px;color:#126246;">ORC 파일과 stripe byte 관계</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px;text-align:center;">
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;"><strong>Header</strong><br><code>ORC</code></td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#eaf7f1;"><strong>Stripe 0</strong><br>Index streams → Data streams → StripeFooter</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;"><strong>Stripe 1 … N</strong><br>각 stripe는 whole rows를 갖고 독립 처리 가능</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#eaf7f1;"><strong>File Metadata</strong><br>Stripe statistics</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;"><strong>File Footer</strong><br>StripeInformation·schema·file stats·rowIndexStride</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#fff8df;"><strong>Postscript</strong><br>Footer/metadata length·compression·version·magic</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;"><strong>Postscript length</strong><br>마지막 1B</td></tr>
+</table>
+<p style="font-size:14px;color:#53635c;">Stripe 내부에서 같은 column의 여러 stream 또는 서로 다른 columns의 stream에 고정 순서를 가정하지 않는다. 정확한 kind·column id·length는 StripeFooter directory로 계산한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Stripe는 whole-row partition이자 recovery/task 단위다</h3>
+<p>Row는 stripe 경계를 넘지 않는다. File footer의 StripeInformation은 <code>offset</code>, <code>indexLength</code>, <code>dataLength</code>, <code>footerLength</code>, <code>numberOfRows</code>를 제공한다. Reader는 선택 stripe의 footer와 필요한 streams만 range-read한다. Stripe가 크면 sequential I/O·compression이 좋아질 수 있지만 writer buffer, retry bytes, pruning granularity와 task parallelism 비용이 커진다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 한 column은 여러 streams로 분해된다</h3>
+<p>Integer column은 nullable이면 PRESENT bit stream과 non-null values DATA stream을 가질 수 있다. Binary/string은 LENGTH와 DATA, dictionary encoding이면 DICTIONARY_DATA와 dictionary index stream이 추가될 수 있다. 모든 값이 non-null이면 PRESENT를 생략할 수 있으므로 “stream이 없으면 corrupt”가 아니다. Schema·encoding·StripeFooter를 함께 해석한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Row index positions는 decoder state다</h3>
+<p>RowIndexEntry의 positions는 단순 file offset 하나가 아니다. Compression chunk 위치, decompressed bytes 소비량, RLE run에서 이미 소비한 values처럼 stream decoder를 같은 logical row boundary로 복원하는 state가 포함될 수 있다. Multiple streams의 position sequence를 잘못 매핑하면 column 간 row alignment가 어긋나 silent corruption이 생긴다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Three-level statistics</h3>
+<p>ORC는 file, stripe, row-group(stride) 수준에서 statistics를 활용한다. File/stripe 통계는 tail에 있어 body를 읽기 전 pruning에 쓰고, row-level index는 stripe 앞 index section에 있어 selective scan일 때만 읽을 수 있다. Statistics가 missing·unsupported·untrusted면 skip하지 않고 다음 단계로 내려간다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Bloom filter의 수학적 contract</h3>
+<p>m-bit bitset에 n개 값을 k개 hash 위치로 표시한다. Query 값의 k개 bit 중 하나라도 0이면 확실히 absent, 모두 1이면 maybe present다. 대략적인 false-positive probability는 <code>p ≈ (1-e^(-kn/m))^k</code>다. n을 과소 추정하거나 m을 줄이면 p가 올라가 read 절감이 약해진다. p가 커져도 correctness는 유지되지만 hash·serialization mismatch로 false negative가 생기면 안전 계약이 깨진다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 Statistics → bloom 순서</h3>
+<p>Range predicate는 min/max가 주역이다. Equality/IN에서는 먼저 min/max로 명백한 out-of-range를 제거하고, 남은 broad ranges에 bloom을 적용한다. Bloom은 ordering 정보를 보존하지 않으므로 <code>x &gt; 100</code> 같은 range를 직접 해결하지 않는다. Positive candidate는 반드시 stream data에서 실제 equality를 검사한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">소유자와 불변식</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>File tail</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer가 compression·schema·stripes·statistics 지도를 소유한다. Length와 ranges가 같은 immutable object version 안에서 유효해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Stripe footer</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Stream directory와 encodings를 소유한다. Length 합이 stripe sections 경계와 맞아야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Row index</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Stride stats와 stream positions를 소유한다. 모든 projected streams가 같은 logical row group에 seek되어야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Bloom</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer hash/version/bitset contract를 소유한다. Inserted value는 절대 negative가 아니어야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Success</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer는 tail complete·reopen validation 뒤 snapshot commit, reader는 candidates의 actual predicate를 적용한 뒤에만 result를 확정한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:28%;">결정</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">판단 기준과 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Stripe size</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer memory, task parallelism, projected range size, compression, retry cost, storage block/object 요청을 함께 측정한다. 기본값을 절대 규칙으로 쓰지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Index stride</strong></td><td style="padding:8px;border:1px solid #d9e6df;">작으면 index bytes·writer CPU가 늘고 pruning/seek granularity가 정밀해진다. Predicate selectivity와 row width로 실험한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Bloom columns</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Equality/IN이 많고 min/max range가 넓은 selective columns에 우선한다. 모든 column에 켜지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>FPP / capacity</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Distinct per stride와 target false-positive rate로 bit budget을 잡고 actual observed candidate rate를 측정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Dictionary</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Partial stripe read에도 dictionary 전체가 필요할 수 있다. Cardinality·dictionary bytes·seek 이득을 함께 본다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Version matrix</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer version, bloom UTF-8 encoding, compression, vectorized reader, calendar/timestamp semantics를 실제 engine pair로 검증한다.</td></tr>
+</table>
+<h3 style="font-size:18px;color:#126246;">Best practice·anti-pattern·edge case</h3>
+<ul style="padding-left:22px;"><li><strong>Best:</strong> Explain/profile에서 stripes·row groups considered/skipped와 stat/bloom reason, index bytes, data bytes를 분리한다.</li><li><strong>Best:</strong> Bloom on/off와 full scan의 result hash·count를 canary에서 비교한다.</li><li><strong>Best:</strong> StripeFooter streams를 길이 누적으로 계산하되 section boundary와 overflow를 먼저 검증한다.</li><li><strong>Best:</strong> File/stripe stats → row index stats → bloom 순으로 cheap·broad filter부터 적용한다.</li><li><strong>Anti-pattern:</strong> Bloom positive를 exact match로 간주해 data predicate를 생략한다.</li><li><strong>Anti-pattern:</strong> Stripe 내부 stream 순서를 column id 순이라고 하드코딩한다.</li><li><strong>Anti-pattern:</strong> 10,000 rows를 모든 file의 고정 stride로 가정한다.</li><li><strong>Edge:</strong> All-null column은 PRESENT만 있거나 data stream이 비어 있을 수 있다. Missing stream과 corruption을 구분한다.</li><li><strong>Edge:</strong> High-cardinality/oversubscribed bloom은 false positives가 늘어 성능만 악화될 수 있다.</li><li><strong>Version:</strong> Obsolete non-UTF8 bloom과 현재 UTF8 bloom 처리 정책, native/hive reader 차이를 배포 version 문서와 golden files로 확인한다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Bloom on/off 결과 불일치, 특정 equality key 누락, row index seek 뒤 column alignment 오류, stripe footer parse/EOF, range 416, decompression error, skipped row groups 급증·0, index I/O가 data 절감보다 큼.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Snapshot·object version/size/checksum, Postscript/Footer/StripeInformation, StripeFooter streams(kind·column·length), schema/type ids, rowIndexStride, RowIndexEntry positions/stats, bloom stream kind/version/hash count/bitset, writer/reader build, SARG, pruning reasons, full-scan matching IDs.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Tail/stripe footer truncation, wrong stream-order assumption, length overflow, position vector mapping bug, compression/RLE state mismatch, stale footer cache, wrong stride, bloom encoding/hash mismatch, corrupt bitset false negative, unsafe SARG conversion, writer stats bug.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Affected writer generation에서 bloom/row-index pruning을 끄고 stripe full read로 correctness를 복구한다. Snapshot/object를 고정하고 tail·stripe index bytes를 보존한다. On/off shadow query로 최소 key·stripe·stride를 찾는다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">rollback/복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good reader/policy/snapshot으로 rollback한다. Source rows에서 compatible writer로 immutable ORC를 재작성하고 reopen·full scan·count/min/max/null·matching IDs를 대사한다. Atomic snapshot으로 교체하고 bad files를 quarantine한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Bloom negative를 무조건 신뢰, bitset/positions 수동 patch, corrupt object overwrite, failed stripe skip 후 성공 처리, version 추측, cache만 무차별 삭제, evidence 없는 재압축, 결과 누락 상태로 downstream checkpoint를 진행하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: row-index + bloom pruning simulator</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리로 stride별 min/max와 bloom filter를 만든다. Statistics→bloom→actual predicate 순서, deterministic false positive와 bit corruption false negative를 관찰한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package·파일·Docker가 필요 없다. 교육용 bloom이며 ORC hash/serialization 구현을 대체하지 않는다.</p>
+<p><strong>실행 전 예측:</strong> Values 범위가 1~100인 group에서 42가 없으면 min/max만으로 skip 가능한가? Bloom “maybe”는 match인가? Inserted 42의 bit 하나를 지우면 어떤 correctness failure가 생기는가?</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+import hashlib
+
+class Bloom:
+    def __init__(self, m=32, k=3):
+        self.m, self.k, self.bits = m, k, 0
+    def indexes(self, value):
+        raw = str(value).encode("utf-8")
+        d = hashlib.sha256(raw).digest()
+        h1 = int.from_bytes(d[:8], "little")
+        h2 = int.from_bytes(d[8:16], "little") | 1
+        return [(h1 + i*h2) % self.m for i in range(self.k)]
+    def add(self, value):
+        for i in self.indexes(value): self.bits |= 1 &lt;&lt; i
+    def maybe(self, value):
+        return all(self.bits &amp; (1 &lt;&lt; i) for i in self.indexes(value))
+
+def build(values):
+    b = Bloom()
+    for v in values: b.add(v)
+    return {"values":values, "min":min(values), "max":max(values), "bloom":b}
+
+groups = [build([1,5,9,100]), build([40,42,50,60]), build([200,300])]
+assert all(g["bloom"].maybe(v) for g in groups for v in g["values"])
+
+def plan_eq(group, value, trust_bloom=True):
+    if value &lt; group["min"] or value &gt; group["max"]:
+        return False, "SKIP_STATS_DISJOINT"
+    if trust_bloom and not group["bloom"].maybe(value):
+        return False, "SKIP_BLOOM_NEGATIVE"
+    return True, "READ_CANDIDATE"
+
+for query in [42, 7]:
+    actual=[]
+    print("query=", query)
+    for n,g in enumerate(groups):
+        read,reason=plan_eq(g,query)
+        print(" RG",n,"READ" if read else "SKIP",reason)
+        if read: actual += [v for v in g["values"] if v == query]
+    print(" result=",actual)
+
+# Find a deterministic false positive in group 0: maybe does not mean present.
+g0=groups[0]
+fp=next(v for v in range(g0["min"],g0["max"]+1)
+        if v not in g0["values"] and g0["bloom"].maybe(v))
+print("false_positive=",fp,"actual_present=",fp in g0["values"])
+
+# Failure injection: corrupt one required bit for inserted value 42.
+g1=groups[1]
+bit=g1["bloom"].indexes(42)[0]
+g1["bloom"].bits &amp;= ~(1 &lt;&lt; bit)
+print("corrupt_bloom_42_maybe=",g1["bloom"].maybe(42))
+unsafe_read,reason=plan_eq(g1,42,trust_bloom=True)
+safe_read,_=plan_eq(g1,42,trust_bloom=False)
+print("unsafe=",unsafe_read,reason,"safe_fallback_read=",safe_read)
+
+assert fp not in g0["values"]
+assert not unsafe_read and safe_read
+PY</code></div>
+<p><strong>예상 관찰:</strong> Query 42는 RG0가 min/max와 겹치지만 bloom negative로 skip, RG1은 read 후 실제 42를 찾고 RG2는 stats로 skip한다. 작은 bitset 때문에 없는 값이 bloom positive인 false positive도 나오지만 actual predicate 결과에는 포함되지 않는다. 42의 bit를 지우면 false negative로 RG1이 unsafe skip되며, bloom을 불신해 read하면 복구된다.</p>
+<h3 style="font-size:18px;color:#126246;">실패 주입·오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입:</strong> Inserted 42의 bit를 지워 no-false-negative invariant를 깨뜨린다. Error 없이 data가 누락되는 correctness incident다.</li><li><strong>오류:</strong> Bloom positive를 결과에 바로 넣지 않는다. 실제 data equality를 적용한다.</li><li><strong>오류:</strong> Python SHA-256 simulator hash를 ORC production hash로 사용하지 않는다. Writer/reader의 공식 version contract를 따른다.</li><li><strong>오류:</strong> Bitset이 작아 false positive가 많아져도 correctness는 유지된다. 이것을 corruption과 구분한다.</li><li><strong>확장:</strong> m·k·n을 바꾸며 observed false-positive rate, index bytes와 avoided groups를 표로 만든다.</li><li><strong>Cleanup:</strong> Memory object만 사용하므로 파일·package·container가 남지 않는다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Stripe는 whole rows를 가지며 row는 stripe를 넘지 않는다.</li><li>Stripe 안 stream 순서는 StripeFooter directory가 결정한다.</li><li>Missing PRESENT stream은 all-non-null이면 정상일 수 있다.</li><li>Row index position은 offset 하나가 아니라 decoder resume state일 수 있다.</li><li>Row index stride는 file footer의 값이며 10,000을 하드코딩하지 않는다.</li><li>Bloom은 equality/IN 후보 제거에 적합하고 range ordering은 제공하지 않는다.</li><li>Bloom negative만 확정이며 positive는 actual predicate가 필요하다.</li><li>Dictionary는 partial stripe read에도 전체를 읽을 수 있다.</li><li>Hash/UTF-8/version mismatch는 false negative를 만들어 correctness를 깰 수 있다.</li><li>Pruning on/off result canary 없이 성능 지표만 보지 않는다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. ORC reader가 equality predicate로 최소 byte만 읽는 흐름을 설명하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Tail/Postscript/Footer로 stripes·schema·compression을 얻는다 → file/stripe stats로 prune한다 → selected stripe footer로 stream directory를 만든다 → predicate column ROW_INDEX와 bloom을 읽는다 → stats→bloom negative 순으로 row groups를 좁힌다 → positions로 projected streams를 seek/decode한다 → actual equality로 positive 후보를 검증한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Row index stride와 bloom false-positive rate를 어떻게 정합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Query projection/equality selectivity, row width, distinct/stride, stripe size, object request latency를 수치화한다 → 작은 stride의 index·writer CPU와 pruning 이득을 비교한다 → target FPP에서 bit budget을 계산한다 → representative load의 index/data bytes·groups skipped·P95·cost를 측정한다 → correctness canary와 rollback 기준을 둔다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Bloom filter 적용 뒤 특정 고객이 검색되지 않습니다. 대응하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Bloom pruning을 즉시 disable해 full stripe read로 correctness를 복구한다 → snapshot·tail·stripe footer·row index·bloom bytes·hash/version과 missing IDs를 보존한다 → on/off 최소 반례로 false negative를 증명한다 → writer/reader encoding mismatch·bit corruption을 진단한다 → last-good rollback 또는 immutable rewrite·full scan 대사·atomic republish를 설명한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Statistics가 missing/untrusted일 때 safe pruning 정책은?</li><li>Physical type·logical type·column order가 min/max 비교에 각각 왜 필요한가?</li><li>Stale footer cache를 막는 cache key와 offset 검증 불변식은?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>ORC file tail과 stripe 내부 구조를 byte 순서로 설명하라.</li><li>RowIndexEntry의 positions가 단순 offset보다 복잡한 이유는?</li><li>Bloom false positive와 false negative의 성능·정합성 영향을 비교하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">No-match를 증명할 수 없으므로 READ한다. False-positive read는 비용이고 false-negative skip은 정합성 장애다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Physical은 byte carrier, logical은 application 의미/unit, column order는 bound comparison 규칙이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Version/ETag+size에 cache를 묶고 <code>length≤limit-start</code>로 overflow-safe range 검증을 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Header→stripes(index streams→data streams→stripe footer)→file metadata→footer→postscript→1B postscript length다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Compressed chunk offset, decompressed bytes와 RLE values consumed 등 decoder state를 재현해야 정확한 row boundary로 seek할 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">False positive는 불필요 read만 늘리고 actual predicate가 제거한다. False negative는 matching row group을 skip해 결과를 누락한다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. Tail/stream directory, decoder positions, probabilistic contract와 복구까지 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://orc.apache.org/specification/ORCv1/" style="color:#126246;">Apache ORC — ORC Specification v1</a>: File tail, StripeInformation, stream layout, StripeFooter와 row index/bloom structures를 확인한다.</li><li><a href="https://orc.apache.org/docs/indexes.html" style="color:#126246;">Apache ORC — Indexes</a>: File·stripe·row level statistics와 SARG pruning 흐름을 확인한다.</li><li><a href="https://orc.apache.org/docs/core-java-config.html" style="color:#126246;">Apache ORC — Java Configuration</a>: Stripe size, row index stride, bloom columns와 current writer/reader knobs를 확인한다.</li><li><a href="https://orc.apache.org/docs/java-tools.html" style="color:#126246;">Apache ORC — Java Tools</a>: Statistics·bloom filter를 검사하는 check 도구와 metadata 관찰 방법을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">ORC v2 문서는 evolving draft이므로 여기서는 안정된 v1 specification과 공식 운영 문서를 기준으로 삼았다. 실제 기본값과 bloom encoding 지원은 배포 library/version에서 다시 확인한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 4 · Day 26 — nested data와 repetition/definition level</strong><br>List·struct·map의 logical tree가 primitive leaf streams로 내려갈 때 null·empty·repeated row boundary를 level 값으로 복원하는 알고리즘을 다룬다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · prune cheaply, seek exactly, verify candidates against data</td></tr>
+</table></td></tr></table></body></html>
