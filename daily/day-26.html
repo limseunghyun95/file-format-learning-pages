@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 26</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 4 / DAY 26 · LESSON</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">nested data와 repetition/definition level</h1><div style="font-size:15px;color:#d8eee5;">Logical tree를 leaf values와 level streams로 분해·복원 · 예상 학습 65분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>Parquet은 nested object를 통째로 저장하지 않고 primitive leaf마다 values를 저장한다. <strong>Definition level</strong>은 leaf path가 어디까지 존재하는지, <strong>repetition level</strong>은 어느 repeated ancestor에서 연속되는지 나타내 null list·empty list·null element·새 row 경계를 손실 없이 복원한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Nested data</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Row 안에 struct·list·map이 다시 들어 있는 계층형 값이다. 예: 주문 row 안의 여러 상품과 각 상품의 선택적 tag.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Logical tree</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Application이 보는 object 구조다. Parent-child, nullability, list element 관계를 가진다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Primitive leaf</strong></td><td style="padding:9px;border:1px solid #d9e6df;">더 내려갈 child가 없는 실제 scalar column이다. Group 자체는 value stream을 갖지 않고 id·tag 같은 leaf가 column chunk가 된다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Path</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Root에서 leaf까지의 schema 경로다. 예: <code>orders.list.element.tag</code>.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Required</strong></td><td style="padding:9px;border:1px solid #d9e6df;">반드시 한 값이 있는 field다. Definition level을 늘리지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Optional</strong></td><td style="padding:9px;border:1px solid #d9e6df;">0개 또는 1개 값이다. Path가 여기까지 정의됐는지 표현해야 하므로 max definition level을 1 늘린다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Repeated</strong></td><td style="padding:9px;border:1px solid #d9e6df;">0개 이상 값이다. Definition level과 repetition level을 각각 1 늘린다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Definition level, D</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Leaf path의 optional/repeated nodes가 몇 단계까지 존재하는지 나타내는 작은 정수다. D가 leaf의 max D에 도달할 때만 physical value가 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Repetition level, R</strong></td><td style="padding:9px;border:1px solid #d9e6df;">현재 record가 어느 repeated ancestor에서 앞 record와 이어지는지 나타낸다. R=0은 새 top-level row의 시작이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Placeholder</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Null·empty 구조도 row 경계를 보존해야 하므로 level record는 남지만 physical value가 없는 항목이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Materialization</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Leaf vectors와 level streams를 application의 struct/list object로 다시 조립하는 과정이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>RLE</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Run-Length Encoding. 같은 작은 level이 반복될 때 값과 반복 횟수로 압축하는 방식이며 bit-packing hybrid와 함께 쓰인다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>Columnar storage는 같은 leaf 값을 모아 압축·projection하기 좋다. 하지만 leaf values만 저장하면 <code>null</code>, 빈 list <code>[]</code>, null element <code>[null]</code>, tag가 null인 struct를 구분할 수 없다. 이 구조 정보가 definition/repetition levels에 있다.</p>
+<p>Nested path 하나만 projection해도 values만 읽어서는 top-level row를 만들 수 없다. Reader는 해당 leaf의 levels도 decode해 row boundaries와 list offsets, validity bitmap을 만들어야 한다. 따라서 “100개 leaf 중 1개만 읽는다”는 비용에도 level bytes·parent offsets·materialization CPU가 포함된다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>핵심 불변식:</strong> Schema에서 계산한 max D/R, page의 level count, physical non-null value count, sibling leaf의 row/repetition 경계가 서로 맞아야 한다. 불일치는 조용히 padding하지 말고 corrupt 또는 incompatible schema로 격리한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① Logical rows + schema</strong><br><code>orders: list&lt;struct&lt;id, tag?&gt;&gt;?</code>와 null·empty·elements를 받는다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ schema path 분석: optional/repeated 수로 max D/R 계산</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Shred</strong><br>각 primitive leaf별로 (R, D, optional value) records를 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ R/D는 RLE·bit-pack, non-null values는 dictionary/plain 등으로 encode</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ Data page bytes</strong><br>Page V1/V2 규칙에 따라 repetition levels·definition levels·encoded values를 배치한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ column chunk range read → decompress/level decode</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Validate + synchronize</strong><br>Level range·counts·value consumption·sibling boundaries를 검증한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ R=0은 새 row, D threshold는 null/empty/value 상태</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Assemble vectors</strong><br>Leaf values + validity + list offsets → nested column vector를 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ actual predicate·projection</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>⑥ Logical rows</strong><br>null list, empty list, null element와 structs를 정확히 복원한다.</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Control path:</strong> Footer schema → leaf path → max D/R → page header/encoding → selected leaves → validation policy.<br><strong>Data path:</strong> Page bytes → R/D streams + values → row/list boundaries → validity/offset/value vectors → nested result.</div>
+
+<h3 style="font-size:18px;color:#126246;">예제 schema: nullable list, nullable struct element, nullable tag</h3>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>optional group orders (LIST) {
+  repeated group list {
+    optional group element {
+      required int64 id;
+      optional binary tag (STRING);
+    }
+  }
+}</code></div>
+<p><code>orders.list.element.id</code>는 max D=3, max R=1이다. <code>tag</code> path는 optional tag가 하나 더 있어 max D=4, max R=1이다. Required id는 D를 늘리지 않는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">Logical rows → 두 leaf streams</h3>
+<div style="background:#f7faf8;border:1px solid #d9e6df;padding:13px;margin:10px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;">row 0: orders = null
+row 1: orders = []
+row 2: orders = [null, {id:7, tag:null}, {id:8, tag:"x"}]</div>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px;text-align:center;">
+<tr><th style="padding:7px;border:1px solid #d9e6df;background:#173c32;color:#fff;">Record</th><th style="padding:7px;border:1px solid #d9e6df;background:#173c32;color:#fff;">id: (R,D,value)</th><th style="padding:7px;border:1px solid #d9e6df;background:#173c32;color:#fff;">tag: (R,D,value)</th><th style="padding:7px;border:1px solid #d9e6df;background:#173c32;color:#fff;">의미</th></tr>
+<tr><td style="padding:7px;border:1px solid #d9e6df;">0</td><td style="padding:7px;border:1px solid #d9e6df;">(0,0,–)</td><td style="padding:7px;border:1px solid #d9e6df;">(0,0,–)</td><td style="padding:7px;border:1px solid #d9e6df;">null list</td></tr>
+<tr><td style="padding:7px;border:1px solid #d9e6df;">1</td><td style="padding:7px;border:1px solid #d9e6df;">(0,1,–)</td><td style="padding:7px;border:1px solid #d9e6df;">(0,1,–)</td><td style="padding:7px;border:1px solid #d9e6df;">empty list</td></tr>
+<tr><td style="padding:7px;border:1px solid #d9e6df;">2</td><td style="padding:7px;border:1px solid #d9e6df;">(0,2,–)</td><td style="padding:7px;border:1px solid #d9e6df;">(0,2,–)</td><td style="padding:7px;border:1px solid #d9e6df;">첫 element=null</td></tr>
+<tr><td style="padding:7px;border:1px solid #d9e6df;">3</td><td style="padding:7px;border:1px solid #d9e6df;">(1,3,7)</td><td style="padding:7px;border:1px solid #d9e6df;">(1,3,–)</td><td style="padding:7px;border:1px solid #d9e6df;">같은 list, tag=null</td></tr>
+<tr><td style="padding:7px;border:1px solid #d9e6df;">4</td><td style="padding:7px;border:1px solid #d9e6df;">(1,3,8)</td><td style="padding:7px;border:1px solid #d9e6df;">(1,4,"x")</td><td style="padding:7px;border:1px solid #d9e6df;">같은 list, tag value</td></tr>
+</table>
+<p style="font-size:14px;color:#53635c;">각 leaf는 5개의 level records를 갖지만 id physical values는 2개, tag physical values는 1개뿐이다. Null은 value section에 저장하지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 max D/R은 schema에서 결정된다</h3>
+<p>Root→leaf path를 걸으며 optional은 max D만 1, repeated는 max D와 max R을 각각 1 늘린다. Required는 어느 row에서도 존재하므로 level width를 늘리지 않는다. 필요한 bit width는 <code>ceil(log2(maxLevel+1))</code>다. Max D=4이면 0~4를 표현하므로 3 bits가 필요하다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Definition level은 null의 위치를 보존한다</h3>
+<p>D가 낮다는 것은 path 중 더 위 ancestor에서 구조가 멈췄다는 뜻이다. 같은 “value 없음”도 D=0 null list, D=1 empty list, D=2 null element, tag path D=3 tag null로 구분된다. D=max D일 때만 decoder가 value stream에서 하나를 소비한다. 이 소비 횟수가 실제 encoded values count와 맞아야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Repetition level은 row·list 경계를 보존한다</h3>
+<p>R=0이면 어떤 repeated ancestor도 이전 record와 이어지지 않으므로 새 top-level row다. R=1은 이 schema에서 같은 orders list의 다음 element다. 더 깊은 list-of-list에서는 max R이 2 이상이며 level이 어느 repeated depth에서 새 element가 시작됐는지 알려 준다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Data page에서 levels와 values는 별도 영역이다</h3>
+<p>Data Page V1의 payload는 repetition levels → definition levels → encoded values 순이며 해당 page 규칙에 따라 해석한다. Data Page V2는 level byte lengths를 header에 갖고 levels를 압축하지 않은 채 두며 value section만 compression 대상이 될 수 있다. V1/V2의 RLE length prefix 규칙도 다르므로 page type을 무시한 decoder는 offset부터 틀어진다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Page 경계와 row 경계는 항상 같지 않다</h3>
+<p>공식 Thrift 계약상 Data Page V2는 R=0인 row boundary에서 시작하고 row를 page 사이에 나누지 않는다. V1은 OffsetIndex가 있으면 page가 row boundary에서 시작해야 하지만, 없으면 repeated row 중간에서 시작할 수 있다. Reader는 “새 page=새 row”로 가정하지 말고 level state와 index contract를 따라야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 Vectorized materialization</h3>
+<p>Decoder는 R/D를 batch로 풀어 parent validity, list offsets, element validity를 만들고 D=max leaf records에서만 values를 채운다. Filter가 leaf에만 적용되어도 surviving parent rows와 element positions를 추적해야 한다. Deep nesting·wide lists·small batches에서는 offset construction, branch와 memory allocation이 projection I/O 절감보다 커질 수 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">소유자와 불변식</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema tree</strong></td><td style="padding:8px;border:1px solid #d9e6df;">File footer가 repetition type·logical LIST/MAP·children을 소유한다. Leaf path와 max D/R 계산이 reader model과 일치해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Level streams</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer가 row/element/null boundaries를 소유한다. 모든 level은 범위 안이고 declared count만큼 decode되어야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Value stream</strong></td><td style="padding:8px;border:1px solid #d9e6df;">D=max D record 수만큼 physical values가 소비되어야 한다. 부족·초과 모두 corruption이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Sibling leaves</strong></td><td style="padding:8px;border:1px solid #d9e6df;">같은 repeated subtree의 row/list boundaries가 구조적으로 합쳐져야 한다. 단순 record index zip은 안전하지 않을 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Success</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Reader는 level/value counts를 모두 소비하고 top-level row count·offset monotonicity·null semantics를 검증한 뒤에만 batch를 반환한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:28%;">결정</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">판단 기준과 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>LIST schema</strong></td><td style="padding:8px;border:1px solid #d9e6df;">새 writer는 공식 3-level LIST를 사용한다. Nullable list와 nullable element를 요구사항에서 따로 결정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Legacy read</strong></td><td style="padding:8px;border:1px solid #d9e6df;">2-level/이름이 다른 LIST는 공식 backward-compatibility rules와 engine matrix로 해석한다. 추측해 rewrite하지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Projection</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Leaf bytes뿐 아니라 levels·dictionary·parent offsets 비용을 측정한다. Nested leaf 하나가 독립 scalar처럼 공짜는 아니다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Filter pushdown</strong></td><td style="padding:8px;border:1px solid #d9e6df;">ANY/ALL, null element, empty list semantics가 engine마다 동일한지 golden rows로 검증한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Batch sizing</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Top-level rows보다 total elements와 variable-length bytes가 memory를 지배할 수 있다. Max list length·p99 child count로 제한한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema evolution</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Optional leaf 추가는 대체로 안전해도 required/optional·list element nullability 변경은 D thresholds와 의미를 바꾼다. Reader/writer pair로 round-trip한다.</td></tr>
+</table>
+<h3 style="font-size:18px;color:#126246;">Best practice·anti-pattern·edge case·version 차이</h3>
+<ul style="padding-left:22px;"><li><strong>Best:</strong> null list, empty list, [null], [{field:null}], multi-element, deep nested를 golden dataset에 모두 넣는다.</li><li><strong>Best:</strong> Leaf path별 max D/R, decoded level count, non-null values consumed, top rows를 metric으로 남긴다.</li><li><strong>Best:</strong> Projection/full read와 engine A/B의 logical JSON hash를 비교한다.</li><li><strong>Anti-pattern:</strong> D가 max보다 작으면 모두 같은 null로 합친다.</li><li><strong>Anti-pattern:</strong> 새 page마다 새 row를 시작하거나 sibling leaves를 record index로만 zip한다.</li><li><strong>Anti-pattern:</strong> Legacy 2-level LIST를 새 writer가 계속 생산한다.</li><li><strong>Edge:</strong> 한 top-level row의 거대한 list가 page/batch보다 커져 skew·OOM·slow retry를 만든다.</li><li><strong>Edge:</strong> All-null leaf는 values bytes가 0이어도 levels로 rows를 표현할 수 있다.</li><li><strong>Version:</strong> V1/V2 level placement·length prefix·row-boundary contract가 다르다. Page type과 실제 library support를 함께 확인한다.</li><li><strong>Engine:</strong> Legacy LIST interpretation, nested predicate pushdown, field-id/name resolution은 엔진별 golden compatibility matrix로 검증한다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Row count 불일치, list가 다음 row에 붙음, null list가 empty로 변함, sibling fields가 엇갈림, values EOF/leftover, invalid level, nested projection만 결과가 다름, 특정 engine에서만 corrupt/OOM.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Immutable object version/checksum, footer schema tree와 LIST/MAP annotations, leaf paths/max D/R, page type/header/num_values·num_rows, R/D raw bytes·decoded histogram, physical values count, sibling boundaries, writer/reader versions, projection/full-read outputs, minimal failing row.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Wrong max D/R, V1/V2 length-prefix confusion, truncated level run, invalid R at row boundary, value under/over-consumption, legacy LIST misinterpretation, schema projection mismatch, field-id/name mismatch, oversized element count, writer bug, partial publish.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Affected snapshot을 고정하고 nested projection/pushdown을 끈 full read로 비교한다. 최소 row group/page와 leaf를 격리하고 level/value counts를 strict mode로 검증한다. 불일치 file은 quarantine한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">rollback/복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good reader/schema/snapshot으로 rollback한다. Source-of-truth logical rows를 표준 3-level LIST writer로 immutable rewrite하고 null/empty golden rows·row counts·logical hashes를 대사한 뒤 atomic snapshot으로 교체한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Missing values를 null로 padding, extra values truncate, levels 수동 patch, null/empty 합치기, corrupt page skip 후 성공 처리, bad object overwrite, writer version 추측, 원본 증거 없이 재작성하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: leaf level streams로 rows 복원</h2>
+<p><strong>목표:</strong> Python 표준 라이브러리로 id/tag leaf의 (R,D,value)를 검증하고 null list·empty list·null element·struct를 복원한다. Repetition level 한 개를 변조해 sibling alignment corruption을 탐지한다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package·파일·Docker가 필요 없다. 실제 Parquet RLE byte decoder가 아니라 level semantics simulator다.</p>
+<p><strong>실행 전 예측:</strong> id records 5개에서 physical int는 몇 개인가? Tag D=3과 D=4의 차이는? 네 번째 tag record의 R을 1→0으로 바꾸면 왜 값을 임의로 zip하면 안 되는가?</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+id_records = [(0,0,None),(0,1,None),(0,2,None),(1,3,7),(1,3,8)]
+tag_records = [(0,0,None),(0,1,None),(0,2,None),(1,3,None),(1,4,"x")]
+
+def validate(records, max_d, max_r):
+    assert records and records[0][0] == 0
+    assert all(0 &lt;= r &lt;= max_r and 0 &lt;= d &lt;= max_d
+               for r,d,_ in records)
+    assert all((d == max_d) == (v is not None)
+               for r,d,v in records)
+
+def reconstruct(ids, tags):
+    validate(ids, 3, 1)
+    validate(tags, 4, 1)
+    assert len(ids) == len(tags)
+    assert [x[0] for x in ids] == [x[0] for x in tags]
+    rows = []
+    for (r,di,iv),(_,dt,tv) in zip(ids,tags):
+        if r == 0:
+            rows.append(None if di == 0 else [])
+        if di == 0:
+            assert dt == 0
+        elif di == 1:
+            assert dt == 1
+        elif di == 2:
+            assert dt == 2
+            rows[-1].append(None)
+        else:
+            assert di == 3 and dt in (3,4)
+            rows[-1].append({"id":iv,"tag":tv if dt == 4 else None})
+    return rows
+
+rows = reconstruct(id_records, tag_records)
+print("rows=", rows)
+print("id_physical_values=", sum(d == 3 for _,d,_ in id_records))
+print("tag_physical_values=", sum(d == 4 for _,d,_ in tag_records))
+
+# Failure injection: sibling leaf의 같은 element를 새 row처럼 변조.
+bad_tags = tag_records.copy()
+bad_tags[3] = (0,3,None)
+try:
+    reconstruct(id_records, bad_tags)
+except AssertionError:
+    print("QUARANTINE: sibling repetition boundaries differ")
+else:
+    raise AssertionError("corruption was not detected")
+
+assert rows == [None, [], [None,{"id":7,"tag":None},{"id":8,"tag":"x"}]]
+PY</code></div>
+<p><strong>예상 관찰:</strong> 5개 level records에서 id physical values는 2개, tag는 1개다. 정상 streams는 세 rows를 정확히 복원한다. Tag repetition boundary를 변조하면 sibling R streams 불일치로 quarantine 메시지가 나오며 잘못된 row를 반환하지 않는다.</p>
+<h3 style="font-size:18px;color:#126246;">실패 주입·자주 나는 오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입:</strong> 네 번째 tag의 R=1을 R=0으로 바꿔 id와 tag가 다른 top-level row boundaries를 주장하게 한다.</li><li><strong>오류:</strong> Physical value 수를 level record 수로 가정하지 않는다. D=max D일 때만 value를 소비한다.</li><li><strong>오류:</strong> Null list·empty list·null element를 모두 Python None 하나로 바꾸지 않는다.</li><li><strong>오류:</strong> Simulator의 단순 sibling equality를 모든 arbitrary nested schema의 범용 join 알고리즘으로 사용하지 않는다.</li><li><strong>해결:</strong> 실제 reader는 schema path와 repeated ancestor depth에 따라 levels를 merge하고 count·range를 strict 검증한다.</li><li><strong>Cleanup:</strong> Memory object만 사용하므로 파일·package·container가 남지 않는다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Group은 value column이 아니며 primitive leaves가 column chunks가 된다.</li><li>Optional은 max D만, repeated는 max D와 max R을 모두 늘린다.</li><li>D=max D record만 physical value를 소비한다.</li><li>R=0은 새 top-level row이며 새 page와 같은 뜻은 아니다.</li><li>Null list, empty list, null element, null field는 서로 다른 D 상태다.</li><li>Leaf 하나 projection에도 level decoding과 parent offsets가 필요하다.</li><li>Sibling leaves를 단순 record index로 zip하면 arbitrary nesting에서 틀릴 수 있다.</li><li>Data Page V1/V2의 level length·compression·row-boundary 규칙은 다르다.</li><li>Legacy 2-level LIST는 reader compatibility 대상이지 새 writer 권장안이 아니다.</li><li>Nested predicate 성능보다 projection/full-read 결과 동일성을 먼저 검증한다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Parquet이 nullable list와 nullable element를 leaf column에서 어떻게 구분합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> 3-level LIST schema를 제시한다 → leaf path의 optional/repeated nodes로 max D/R을 계산한다 → null list·empty list·null element·value의 D thresholds를 수치 예제로 보인다 → R=0/1로 row·element 경계를 설명한다 → D=max에서만 value 소비 → levels와 values로 offsets/validity를 복원한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Nested column 한 개만 projection하면 비용이 왜 1/N보다 클 수 있습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Selected leaf value pages 외 R/D, dictionary, page headers를 읽는다 → decompress/level decode → parent validity·list offsets·selection을 만든다 → average/p99 element count와 variable bytes를 수치화한다 → cache/branch/allocation·batch trade-off를 측정한다 → flat denormalization 대안과 semantic cost를 비교한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. 특정 engine에서 null list가 empty list로 읽힙니다. 대응하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Snapshot·schema annotation·writer/reader version을 고정한다 → golden rows와 full/projection·engine A/B 결과를 수집한다 → leaf max D/R·raw levels·value counts로 최소 반례를 만든다 → legacy LIST interpretation/V1·V2 decoder/schema mapping 가설을 검증한다 → last-good rollback·quarantine → 표준 3-level immutable rewrite와 atomic republish를 설명한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>ORC stripe 안 세 section과 stream 배치의 진실의 원천은?</li><li>RowIndexEntry positions가 단순 file offset보다 복잡한 이유는?</li><li>Bloom false positive와 false negative 중 어느 쪽이 correctness 장애인가?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Optional·repeated·required가 max D/R에 주는 영향을 설명하라.</li><li>예제 tag leaf에서 D=0·1·2·3·4를 각각 해석하라.</li><li>Page V1/V2와 sibling leaf corruption을 안전하게 처리하는 불변식을 말하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Index streams→data streams→stripe footer이며, kind·column id·length의 진실은 StripeFooter directory다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Compression chunk, decompressed bytes, RLE values consumed 등 decoder resume state를 포함할 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">False positive는 추가 read 비용, false negative는 matching row group을 skip하는 결과 누락 장애다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Optional은 D+1, repeated는 D+1·R+1, required는 둘 다 늘리지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">D0 null list, D1 empty list, D2 null element, D3 struct present/tag null, D4 tag value다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Page type별 length/row-boundary를 따르고 level range·count·D=max value consumption·sibling structural boundaries를 검증한다. 불일치는 quarantine한다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. D/R 계산, leaf streams, materialization과 장애 복구를 하나의 read path로 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://parquet.apache.org/docs/file-format/nestedencoding/" style="color:#126246;">Apache Parquet — Nested Encoding</a>: Definition/repetition level의 공식 의미와 RLE 사용을 확인한다.</li><li><a href="https://parquet.apache.org/docs/file-format/types/logicaltypes/" style="color:#126246;">Apache Parquet — Logical Types</a>: 표준 3-level LIST/MAP와 legacy backward-compatibility rules를 확인한다.</li><li><a href="https://github.com/apache/parquet-format/blob/master/Encodings.md" style="color:#126246;">Apache parquet-format — Encodings</a>: RLE/bit-packing과 Data Page V1/V2 level length-prefix 차이를 확인한다.</li><li><a href="https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift" style="color:#126246;">Apache parquet-format — parquet.thrift</a>: Page header, num_values/num_rows, level byte lengths와 row-boundary 계약을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">문서의 현재 master와 배포 engine의 구현 version은 같다고 가정하지 않는다. Format contract와 library support matrix를 함께 확인하고, 확인하지 않은 기본값은 단정하지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 4 · Day 27 — 랩: PyArrow metadata와 byte range 관찰</strong><br>직접 Parquet를 만들고 footer·row groups·column chunks·pages·nested levels를 metadata와 실제 byte ranges로 연결해 관찰한다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · shred the tree, preserve boundaries, rebuild without guessing</td></tr>
+</table></td></tr></table></body></html>

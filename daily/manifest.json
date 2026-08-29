@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-28T09:08:49+09:00",
+  "updatedAt": "2026-08-29T09:00:08+09:00",
   "lessons": [
     {
       "day": 1,
@@ -230,6 +230,15 @@
       "path": "day-25.html",
       "kind": "lesson",
       "publishedAt": "2026-08-28T09:08:49+09:00"
+    },
+    {
+      "day": 26,
+      "week": 4,
+      "title": "nested data와 repetition/definition level",
+      "summary": "Parquet nested logical tree를 primitive leaf values와 definition/repetition level로 분해하고 null·empty·repeated 경계, page-version 차이와 안전한 복구를 학습합니다.",
+      "path": "day-26.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-29T09:00:08+09:00"
     }
   ]
 }
