@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-08-29T09:00:08+09:00",
+  "updatedAt": "2026-08-30T09:00:50+09:00",
   "lessons": [
     {
       "day": 1,
@@ -239,6 +239,15 @@
       "path": "day-26.html",
       "kind": "lesson",
       "publishedAt": "2026-08-29T09:00:08+09:00"
+    },
+    {
+      "day": 27,
+      "week": 4,
+      "title": "랩: PyArrow metadata와 byte range 관찰",
+      "summary": "PyArrow로 Parquet를 생성해 footer·row group·column chunk metadata를 실제 byte ranges와 연결하고 selective read와 truncated-footer 복구를 통합 실습합니다.",
+      "path": "day-27.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-30T09:00:50+09:00"
     }
   ]
 }

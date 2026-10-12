@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 27</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 4 / DAY 27 · INTEGRATION LAB</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">랩: PyArrow metadata와 byte range 관찰</h1><div style="font-size:15px;color:#d8eee5;">Logical rows → Parquet bytes → footer plan → selective row-group read · 예상 학습 55분 + 실습 40분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>PyArrow로 작은 Parquet를 만들고 마지막 8 bytes에서 footer length를 역산한 뒤, metadata가 가리키는 row group·column chunk offsets와 statistics를 실제 file ranges에 연결한다. Footer가 잘리면 body bytes가 남아도 reader는 안전한 scan plan을 확정할 수 없음을 확인한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>PyArrow</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Apache Arrow의 Python API다. 오늘은 logical table을 Parquet로 쓰고 footer metadata와 선택 row group을 읽는 도구로 사용한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>File metadata</strong></td><td style="padding:9px;border:1px solid #d9e6df;">File 끝에 저장되는 Thrift 구조다. Schema, row groups, column chunks, offsets, compression, encodings, statistics를 담는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Footer</strong></td><td style="padding:9px;border:1px solid #d9e6df;">일반적으로 file metadata와 뒤의 4-byte metadata length·<code>PAR1</code> magic을 묶어 부르는 끝부분이다. Reader의 scan map이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Little endian</strong></td><td style="padding:9px;border:1px solid #d9e6df;">낮은 자리 byte를 먼저 저장하는 정수 byte order다. Parquet의 마지막 metadata length 4 bytes를 이 순서로 해석한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Magic bytes</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Format을 식별하는 고정 marker다. 일반 Parquet file의 시작과 끝은 ASCII <code>PAR1</code>이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Row group</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Row들의 horizontal partition이다. 각 row group은 모든 primitive leaf에 대한 column chunk 하나씩을 갖는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Column chunk</strong></td><td style="padding:9px;border:1px solid #d9e6df;">특정 row group 안 한 primitive leaf의 연속 byte 영역이다. I/O와 projection의 기본 단위다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Page</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Column chunk 안의 encoded·compressed 단위다. Header와 payload가 있고 dictionary/data/index page 종류가 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Byte range</strong></td><td style="padding:9px;border:1px solid #d9e6df;">File의 <code>[start,end)</code> 구간이다. Object storage HTTP Range나 local pread로 필요한 bytes만 가져오는 모델이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Statistics</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Column chunk/page의 min·max·null count 같은 skip hint다. Predicate와 범위가 겹치지 않으면 읽지 않을 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Projection</strong></td><td style="padding:9px;border:1px solid #d9e6df;">요청한 columns만 읽는 것. Nested parent를 요청하면 여러 primitive leaves가 포함될 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Partial publish</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Writer가 완성되기 전 object가 reader에게 노출된 상태다. File 존재와 readable commit은 다르다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>“Parquet는 필요한 column만 읽는다”를 방어하려면 footer에서 column chunk range를 찾는 control path와 그 range를 실제로 읽어 page를 decode하는 data path를 구분해야 한다. Statistics가 row group을 제외하고 projection이 columns를 제외한 뒤에야 읽을 ranges가 정해진다.</p>
+<p>File size만 보고 remote range를 추측하면 dictionary page, page header, nested levels, footer를 빠뜨릴 수 있다. 반대로 column chunk 전체를 매번 읽으면 안전하지만 page index가 줄 수 있는 추가 pruning을 활용하지 못한다. Metadata가 약속하는 단위와 API가 실제 노출하는 단위를 확인해야 한다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>완료 조건:</strong> Writer close 뒤 끝 magic·footer length·footer parse·row count·schema·statistics를 검증하고 immutable object version을 snapshot에 등록해야 publish 성공이다. Body write가 끝났다는 사실만으로는 부족하다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① HEAD / file size</strong><br>Immutable version·size를 고정한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ range: 마지막 8 bytes</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Footer locator</strong><br><code>[metadata length:4 LE][PAR1:4]</code>를 읽어 footer start를 계산한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ range: [footerStart,fileSize)</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ FileMetaData parse</strong><br>Schema·row groups·column chunks·offsets·statistics를 얻는다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ predicate + projection → selected RGs/leaves</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Range plan</strong><br>Dictionary/data page offsets와 compressed size로 필요한 chunk ranges를 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ range GET / pread, coalesce adjacent ranges</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Page read</strong><br>Header → decompress → dictionary/RLE/plain + D/R levels decode.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ vectors + actual predicate</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>⑥ Result + evidence</strong><br>Rows·bytes·row groups scanned/skipped·request count를 기록한다.</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Control path:</strong> Object version/size → footer locator → metadata → predicate/projection → range plan.<br><strong>Data path:</strong> Selected range bytes → page headers/payloads → decompress/decode → vectors → actual rows.</div>
+
+<h3 style="font-size:18px;color:#126246;">일반 Parquet file의 물리 배치</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px;text-align:center;">
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;"><strong>PAR1</strong><br>4B start magic</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#eaf7f1;"><strong>RG0 column chunks</strong><br>각 chunk 안 dictionary/data pages</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#f7faf8;"><strong>RG1 … RGM column chunks</strong><br>Column chunk는 연속, row group 물리 순서는 metadata로 확인</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#eaf7f1;"><strong>FileMetaData</strong><br>Thrift-serialized schema·row groups·column metadata</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#fff8df;"><strong>Metadata length</strong><br>4B little endian</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;"><strong>PAR1</strong><br>4B end magic</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Footer-first은 random I/O를 계획으로 바꾼다</h3>
+<p>Reader는 마지막 8 bytes로 footer 위치를 찾고 metadata를 먼저 읽는다. 이 작은 control read가 없으면 schema도 column chunk 위치도 알 수 없어 body를 안전하게 해석할 수 없다. Remote storage에서는 보통 HEAD 1회, tail range 1회, metadata range 1회가 시작 비용이 되며 tail read 크기에 따라 둘을 합칠 수 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 Offset은 byte ownership 경계다</h3>
+<p><code>dictionary_page_offset</code>가 있으면 chunk 시작 후보는 그것이고, 없으면 <code>data_page_offset</code>다. <code>total_compressed_size</code>는 해당 column chunk가 file에서 차지하는 compressed bytes를 계획하는 데 쓰인다. 모든 offset·length는 <code>0 ≤ start ≤ end ≤ footerStart</code>를 overflow-safe하게 검증한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Statistics는 row-group 제거의 증거다</h3>
+<p>오늘 id를 0~3, 4~7, 8~11 세 row groups로 쓴다. Predicate <code>id BETWEEN 4 AND 7</code>이면 min/max가 겹치는 RG1만 후보가 된다. Statistics가 missing·truncated·type semantics 불명확이면 skip하지 않고 읽어야 correctness를 보존한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Public metadata API와 page parser는 다르다</h3>
+<p>PyArrow의 <code>FileMetaData→RowGroupMetaData→ColumnChunkMetaData</code>는 chunk offsets·sizes·encodings·statistics를 노출한다. 이것만으로 모든 page header 경계를 완전히 나열하는 API라고 가정하지 않는다. Page-level 관찰이 필요하면 page index 또는 format-aware parser를 사용하고 임의 byte pattern search를 경계로 착각하지 않는다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Nested column은 primitive leaf로 보인다</h3>
+<p>Top-level <code>tags: list&lt;string&gt;</code>은 metadata의 primitive path <code>tags.list.element</code>로 나타난다. 그 chunk에는 string values뿐 아니라 definition/repetition levels가 함께 들어 있다. Parent name만 보고 chunk 수를 세면 projection cost와 schema가 어긋날 수 있다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 CPU·I/O·cache trade-off</h3>
+<p>작은 row group은 pruning·retry·parallelism을 정밀하게 하지만 footer와 task/request 수가 늘어난다. 큰 row group은 sequential read·compression이 좋아질 수 있지만 selective query가 더 많은 bytes를 읽는다. 인접 chunks를 한 range로 합치면 request latency는 줄지만 over-read가 늘어난다. 측정치는 transferred bytes, requested ranges, decompressed bytes, decoded values, CPU time으로 분리한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">소유자와 불변식</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Object identity</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Storage가 version/ETag·size를 소유한다. 모든 ranges가 같은 immutable version에서 와야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Footer</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer가 schema·row groups·offsets·statistics를 소유한다. Footer length와 end magic, Thrift parse가 유효해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Chunk range</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Column metadata가 start·compressed size를 소유한다. Range는 file body 안에 있고 겹침/overflow 정책을 통과해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Statistics</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer가 min/max/null semantics를 소유한다. Reader가 type/order를 신뢰할 수 있을 때만 skip한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Publish success</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Close→reopen footer→schema/count/checksum validation→atomic snapshot commit 뒤에만 reader-visible 성공이다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:28%;">결정</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">판단 기준과 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Row-group size</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Selectivity, projected width, task memory, object latency, retry unit, compression을 대표 workload에서 함께 측정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Tail fetch size</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Footer size distribution p99와 request latency를 보고 마지막 8B+metadata를 한 요청에 담을지 결정한다. Hard-coded 64KiB를 계약으로 보지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Range coalescing</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Gap bytes와 추가 request latency를 비교한다. Request 수 감소가 over-read·cache pollution보다 큰 경우만 합친다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Statistics trust</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Writer version·logical type·column order·NaN/null·truncated bound를 검증하고 untrusted면 read fallback한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Observability</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Listed/opened files, footer bytes/latency, selected RGs/chunks, requested/transferred/decompressed bytes, rows output, CPU를 단계별 기록한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Compatibility</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Format version, data page version, codec, logical/nested schema, writer/reader pair를 golden files로 round-trip한다.</td></tr>
+</table>
+<h3 style="font-size:18px;color:#126246;">Best practice·anti-pattern·edge case·version 차이</h3>
+<ul style="padding-left:22px;"><li><strong>Best:</strong> File size, footerStart, row-group/column ranges를 half-open interval <code>[start,end)</code>로 로그한다.</li><li><strong>Best:</strong> Metadata 계획과 실제 read metrics를 비교해 예상 대비 over-read를 찾는다.</li><li><strong>Best:</strong> Close 후 다른 reader process로 reopen validation하고 checksum/version과 함께 publish한다.</li><li><strong>Anti-pattern:</strong> <code>file_offset</code> 하나만 모든 chunk 시작으로 가정하거나 raw bytes에서 magic-like pattern을 page 경계로 추측한다.</li><li><strong>Anti-pattern:</strong> Footer가 없는데 body pages를 salvage해 정상 dataset에 조용히 포함한다.</li><li><strong>Anti-pattern:</strong> <code>total_byte_size</code>와 remote transferred compressed bytes를 같은 metric으로 비교한다.</li><li><strong>Edge:</strong> Dictionary page가 있으면 data_page_offset보다 앞에서 chunk가 시작한다.</li><li><strong>Edge:</strong> Metadata-only file, encrypted footer/column metadata, external file_path는 일반 local single-file 가정과 다르다.</li><li><strong>Version:</strong> Format version과 data page version은 별도 knob다. Writer default를 기억에 의존하지 말고 metadata·명시적 options로 확인한다.</li><li><strong>Engine:</strong> PyArrow public metadata API가 보여 주는 page-index/bloom 세부는 version별로 다를 수 있으므로 없는 속성을 format 부재로 단정하지 않는다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">End magic/Thrift parse 실패, footer length가 file보다 큼, offset range 416/EOF, 특정 RG/column만 decode 오류, metadata row count와 결과 불일치, selective read가 full read와 다름, request·over-read 급증.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Object URI/version/ETag/size/checksum, first/last magic, raw last 8B, footerStart·serialized size, schema/created_by/format version, row-group/column offsets·sizes·stats·encodings, range request/response headers, reader build, full/selective hashes.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Partial publish/truncated footer, stale object size/cache, mixed object versions across ranges, little-endian parse bug, length overflow, wrong dictionary/data offset choice, corrupt page header/payload, unsupported codec/version, bad statistics pruning, wrong nested path.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Reader-visible snapshot에서 file을 quarantine하고 version을 고정한다. Predicate/page pruning을 끈 full row-group read로 범위를 좁히며 raw tail·metadata·failing chunk bytes를 보존한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">rollback/복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good snapshot으로 rollback한다. Source rows에서 새 immutable object를 write→close→reopen→count/schema/stats/hash 검증하고 atomic manifest/snapshot으로 교체한다. Bad object는 증거로 격리한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Footer length/offset 수동 patch, bad object overwrite, failed file/row group skip 후 성공 처리, stats 무조건 신뢰, cache 전체 삭제로 증거 소실, source 검증 없는 salvage를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 40분 통합 실습: metadata에서 실제 ranges까지</h2>
+<p><strong>사전 조건:</strong> 이 저장소 root, Docker Desktop, <code>docker compose build</code> 1회. Image는 Python 3.12와 고정된 <code>pyarrow==20.0.0</code>을 사용한다.</p>
+<p><strong>실행 전 예측:</strong> 12 rows를 row_group_size=4로 쓰면 RG는 몇 개인가? Predicate id 4~7은 어느 RG만 남기는가? File 끝 8 bytes 중 footer length는 어느 4 bytes인가? 끝 6 bytes를 자르면 body가 남아 있어도 metadata read가 성공할까?</p>
+<p><strong>최소 명령:</strong> 처음이면 <code>docker compose build</code>, 이후 아래 한 block을 실행한다.</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>docker compose run --rm lab python - &lt;&lt;'PY'
+from pathlib import Path
+import shutil, struct, tempfile
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+tmp = Path(tempfile.mkdtemp(prefix="day27-"))
+path = tmp / "lab.parquet"
+bad = tmp / "truncated.parquet"
+try:
+    table = pa.table({
+        "id": pa.array(range(12), type=pa.int64()),
+        "group": ["A"]*4 + ["B"]*4 + ["C"]*4,
+        "payload": [f"value-{i:02d}" for i in range(12)],
+        "tags": pa.array([
+            None, [], ["a"], ["a","b"],
+            ["b"], None, [], ["c"],
+            ["c","d"], [], None, ["e"]
+        ], type=pa.list_(pa.string()))
+    })
+    pq.write_table(
+        table, path, row_group_size=4, compression="NONE",
+        use_dictionary=True, write_statistics=True,
+        version="2.6", data_page_version="2.0", data_page_size=256
+    )
+
+    raw = path.read_bytes()
+    assert raw[:4] == b"PAR1" and raw[-4:] == b"PAR1"
+    footer_len = struct.unpack("&lt;I", raw[-8:-4])[0]
+    footer_start = len(raw) - 8 - footer_len
+    assert 4 &lt;= footer_start &lt; len(raw) - 8
+
+    pf = pq.ParquetFile(path)
+    md = pf.metadata
+    print("file_size=", len(raw), "footer_start=", footer_start,
+          "footer_len=", footer_len)
+    print("format=", md.format_version, "created_by=", md.created_by)
+    print("rows=", md.num_rows, "row_groups=", md.num_row_groups,
+          "primitive_leaves=", md.num_columns)
+    print("schema=", md.schema)
+
+    chosen = []
+    chunk_ranges = []
+    for rg_i in range(md.num_row_groups):
+        rg = md.row_group(rg_i)
+        id_stats = rg.column(0).statistics
+        if id_stats.min &lt;= 7 and id_stats.max &gt;= 4:
+            chosen.append(rg_i)
+        for col_i in range(rg.num_columns):
+            col = rg.column(col_i)
+            start = (col.dictionary_page_offset
+                     if col.dictionary_page_offset is not None
+                     else col.data_page_offset)
+            end = start + col.total_compressed_size
+            assert 4 &lt;= start &lt; end &lt;= footer_start
+            chunk_ranges.append((rg_i, col.path_in_schema, start, end))
+        print("RG", rg_i, "rows", rg.num_rows,
+              "id_minmax", (id_stats.min, id_stats.max))
+
+    print("chosen_by_id_4_7=", chosen)
+    projected = pf.read_row_group(chosen[0], columns=["id", "tags"])
+    print("projected_rows=", projected.num_rows,
+          "projected_columns=", projected.column_names)
+    print("first_ranges=", chunk_ranges[:4])
+
+    # Failure injection: footer length와 end magic 일부를 제거한다.
+    bad.write_bytes(raw[:-6])
+    try:
+        pq.read_metadata(bad)
+    except Exception as exc:
+        print("EXPECTED_CORRUPTION=", type(exc).__name__)
+    else:
+        raise AssertionError("truncated footer was accepted")
+
+    assert md.num_row_groups == 3 and chosen == [1]
+    assert projected.column("id").to_pylist() == [4,5,6,7]
+    assert any(p == "tags.list.element" for _,p,_,_ in chunk_ranges)
+finally:
+    shutil.rmtree(tmp)
+    print("cleanup_exists=", tmp.exists())
+PY</code></div>
+<p><strong>예상 관찰:</strong> Row groups는 3개이고 id min/max는 (0,3), (4,7), (8,11)이다. RG1만 선택되고 projected result는 id·tags 4 rows다. Nested leaf path <code>tags.list.element</code>와 실제 chunk ranges가 출력된다. Footer를 자른 file은 metadata read에서 corruption 예외가 나며 cleanup은 False다.</p>
+<h3 style="font-size:18px;color:#126246;">실패 주입·자주 나는 오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입:</strong> End 6 bytes를 제거해 metadata length와 <code>PAR1</code> 일부를 잃게 한다. Body column pages가 남아도 file-level map을 신뢰할 수 없다.</li><li><strong>오류:</strong> PyArrow output의 exact byte sizes/offsets는 library build에 따라 달라질 수 있다. 불변식과 상대 관계를 검증한다.</li><li><strong>오류:</strong> <code>total_byte_size</code>는 row group의 uncompressed column data 합이고 file/range compressed bytes와 같지 않다.</li><li><strong>오류:</strong> Nested parent <code>tags</code>와 primitive metadata path <code>tags.list.element</code>를 혼동하지 않는다.</li><li><strong>오류:</strong> Statistics가 없으면 <code>None.min</code>처럼 접근하지 말고 READ fallback 정책을 적용한다.</li><li><strong>Cleanup:</strong> Script의 <code>finally</code>가 container 내부 임시 directory를 지우고 <code>--rm</code>이 container를 제거한다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Footer metadata는 body 뒤에 있어 마지막 8 bytes에서 역방향으로 찾는다.</li><li>File 존재·body write와 successful publish는 같은 상태가 아니다.</li><li>Row group은 logical horizontal partition이고 column chunk가 연속 byte I/O 단위다.</li><li>Dictionary page가 있으면 chunk start는 data page보다 앞이다.</li><li>Chunk range와 개별 page boundaries는 같은 정보가 아니다.</li><li>Statistics는 no-match 증명에만 쓰며 untrusted면 읽는다.</li><li>Nested top-level column은 여러 primitive leaf paths가 될 수 있다.</li><li>Format version, data page version, codec support는 서로 다른 축이다.</li><li>Object storage ranges는 같은 immutable version/ETag에 묶어야 한다.</li><li>측정은 planned bytes, transferred bytes, decompressed bytes를 분리한다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. Object storage의 Parquet에서 <code>SELECT id WHERE id BETWEEN 4 AND 7</code> read path를 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Immutable object version·size를 고정한다 → tail 8B와 footer range를 읽는다 → schema·RG stats를 parse한다 → no-overlap RG를 제외한다 → id chunk의 dictionary/data offsets와 size를 검증한다 → adjacent ranges/request latency를 최적화한다 → page decode·actual predicate → request/bytes/rows evidence와 failure fallback을 설명한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Row-group size를 16MiB와 512MiB 중 어떻게 선택합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Dataset size, columns/projected width, predicate selectivity, target task concurrency/memory, object request latency, codec throughput, retry SLO를 수치 가정한다 → pruning granularity 대 compression/sequential I/O·footer/task cost를 모델링한다 → 대표 queries에서 transferred/decompressed bytes·CPU·P95·cost를 비교한다 → skew/large nested row edge와 rollback 기준을 둔다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Footer가 잘린 file 1개가 production snapshot에 보입니다. 대응하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Snapshot/object version을 고정하고 quarantine한다 → tail magic·length·size/checksum·writer job logs를 보존한다 → partial publish와 mixed-version range 가설을 확인한다 → last-good snapshot rollback → source rows로 immutable rewrite·reopen validation·count/hash 대사 → atomic snapshot 교체 → temp/staging·commit marker·alert 개선을 설명한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Optional·repeated·required가 max definition/repetition level에 주는 영향은?</li><li>Null list·empty list·null element는 어떤 정보로 구분하는가?</li><li>D=max D인 record와 physical value consumption 관계는?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>마지막 8 bytes로 footerStart를 계산하는 식을 쓰라.</li><li>Predicate·projection이 row groups와 column chunks를 제거하는 순서를 설명하라.</li><li>Partial publish를 정상 완료로 오인하지 않기 위한 writer·reader 불변식은?</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Optional은 max D+1, repeated는 max D+1·max R+1, required는 둘 다 늘리지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Leaf path의 definition level threshold로 ancestor가 어디까지 존재하는지 구분한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">D=max D일 때만 values stream에서 하나를 소비하며 그 수가 physical values count와 맞아야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;"><code>footerStart = fileSize - 8 - littleEndianUInt32(last8[0:4])</code>이며 last4는 <code>PAR1</code>이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Footer→RG statistics로 horizontal partitions 제거→projection으로 primitive leaf chunks 선택→offset ranges 읽기→page decode·actual predicate 순서다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Close 후 end magic·footer parse·ranges·schema/count/checksum을 reopen 검증하고 atomic snapshot commit 전에는 reader에 노출하지 않는다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. Footer control path, chunk data path, byte-range 비용과 partial publish 복구를 수치로 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://github.com/apache/parquet-format/blob/master/README.md" style="color:#126246;">Apache parquet-format — File format</a>: File→row group→column chunk→page 계층과 footer byte layout을 확인한다.</li><li><a href="https://parquet.apache.org/docs/file-format/pageindex/" style="color:#126246;">Apache Parquet — Page Index</a>: Optional page-level statistics·offset index와 page skipping 계약을 확인한다.</li><li><a href="https://arrow.apache.org/docs/python/parquet.html" style="color:#126246;">Apache Arrow — Reading and Writing Parquet</a>: PyArrow row-group read와 metadata inspection 흐름을 확인한다.</li><li><a href="https://arrow.apache.org/docs/python/generated/pyarrow.parquet.read_metadata.html" style="color:#126246;">Apache Arrow — pyarrow.parquet.read_metadata</a>: Single-file footer metadata API와 반환 contract를 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">공식 문서의 최신 API와 이 저장소의 고정 PyArrow 20.0.0은 세부 속성이 다를 수 있다. 실습은 20.0.0에서 검증하고, exact 기본값·offset 숫자는 단정하지 않는다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 4 · Day 28 — 회상: selective query read path 그리기</strong><br>한 query가 file discovery→footer→pruning→range I/O→decompress/decode→vector batch를 통과하는 전체 경로를 빈 종이에 복원하고 Week 4 설계를 방어한다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · read the map, validate the ranges, trust bytes only after commit</td></tr>
+</table></td></tr></table></body></html>
