@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 28</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 4 / DAY 28 · RECALL &amp; REVIEW</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">회상: selective query read path 그리기</h1><div style="font-size:15px;color:#d8eee5;">Parquet·ORC metadata pruning에서 vectorized materialization까지 · 예상 학습 55분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>Selective query는 “조건에 맞는 row만 읽기”가 아니라 <strong>footer·index로 불필요한 byte ranges를 제거하고, 필요한 ranges만 I/O한 뒤, decode·nested reconstruction·late materialization을 거쳐 정확한 rows를 반환하는 다단계 상태 전이</strong>다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:31%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Selective query</strong></td><td style="padding:9px;border:1px solid #d9e6df;">전체 table 중 필요한 columns와 조건을 만족할 가능성이 있는 row ranges만 읽는 query다. Projection과 predicate가 선택성을 만든다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Projection</strong></td><td style="padding:9px;border:1px solid #d9e6df;">SELECT에 필요한 columns만 요청하는 것. Columnar file은 다른 column chunks를 읽지 않을 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Predicate</strong></td><td style="padding:9px;border:1px solid #d9e6df;">WHERE 조건. 예: <code>event_date='2026-10-13' AND amount&gt;100</code>.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Pruning</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Metadata만 보고 결과가 절대 없다고 증명된 partition·file·row group·stripe·page를 건너뛰는 것.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Statistics</strong></td><td style="padding:9px;border:1px solid #d9e6df;">구간의 min, max, null count 등 요약. 불가능한 범위를 제외하지만 보통 정확한 row 위치를 알려주지는 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Bloom filter</strong></td><td style="padding:9px;border:1px solid #d9e6df;">값이 “없음”을 빠르게 증명하는 확률적 자료구조다. False positive는 가능하지만 false negative가 없어야 한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Byte range</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Object/file의 시작 offset과 length로 지정한 연속 bytes. Object storage의 Range GET과 연결된다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Vectorized decode</strong></td><td style="padding:9px;border:1px solid #d9e6df;">값 하나씩 객체로 만들지 않고 column batch 단위로 decode해 CPU branch와 allocation을 줄이는 방식.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Late materialization</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Filter columns를 먼저 decode해 selection vector를 만든 뒤 surviving rows의 payload columns를 늦게 읽거나 조립하는 전략.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Control path</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Schema·metadata·predicate를 이용해 무엇을 읽고 건너뛸지 결정하는 계획 경로.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Data path</strong></td><td style="padding:9px;border:1px solid #d9e6df;">선택된 bytes가 storage→buffer→decompress→decode→result batch로 이동하는 실행 경로.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+<p>Columnar format의 성능은 “압축률이 좋다” 한 문장으로 설명되지 않는다. Query가 1 TB table에서 2 columns와 1% 날짜 범위만 필요하다면, 좋은 reader는 partition·file·row group/stripe·page 순서로 후보를 줄여 실제 I/O를 수 GB 이하로 낮춘다. 하지만 pruning metadata가 없거나 잘못됐거나 predicate가 변환되어 pushdown되지 않으면 같은 file format도 full scan처럼 동작한다.</p>
+<p>반대로 너무 많은 작은 ranges를 요청하면 object-store round trip, TLS, request charge, kernel bookkeeping이 늘어 큰 sequential read보다 느릴 수 있다. 따라서 목표는 “최소 bytes”가 아니라 <strong>정확성을 보존하면서 총비용이 가장 낮은 read plan</strong>이다.</p>
+<div style="padding:14px;background:#fff8df;border:1px solid #ead48a;margin:14px 0;"><strong>핵심 불변식:</strong> Metadata는 skip을 허용하는 증거이지 결과 그 자체가 아니다. “skip”은 false negative를 만들면 안 되며, “read”는 후보를 실제 predicate로 다시 검증해야 한다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:center;font-size:14px;">
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>① SQL / logical predicate</strong><br><code>SELECT id,tags WHERE day=D AND id BETWEEN 4 AND 7</code></td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ normalize expression · resolve schema/field IDs</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>② Catalog·partition pruning</strong><br>Snapshot과 partition metadata로 candidate files를 고정한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ footer/postscript tail range read</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>③ File metadata plan</strong><br>Parquet row groups / ORC stripes의 schema·offset·statistics·indexes를 해석한다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ min/max·null count·Bloom·page/row index로 safe skip</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>④ Range coalescing</strong><br>필요한 column chunk/stream/page ranges를 병합해 I/O requests를 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ Range GET / pread → compressed buffers</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#eaf7f1;"><strong>⑤ Decompress·decode</strong><br>Dictionary·levels·values를 vector batch로 복원하고 filter vector를 만든다.</td></tr>
+<tr><td style="padding:5px;color:#126246;font-weight:700;">↓ surviving positions에 payload/nested parents materialize</td></tr>
+<tr><td style="padding:12px;border:1px solid #bed9cc;background:#f7faf8;"><strong>⑥ Result batch</strong><br>Predicate를 실제 values로 재검증하고 row order·count·null semantics를 보존한다.</td></tr>
+</table>
+<div style="margin:14px 0;padding:12px;border:1px dashed #9bbdaf;background:#fbfdfc;"><strong>Control path:</strong> Query → snapshot/schema → metadata → skip/read decisions → ranges → batch policy.<br><strong>Data path:</strong> Storage bytes → compressed buffers → decompressed pages/streams → level/value vectors → selection → result.</div>
+
+<h3 style="font-size:18px;color:#126246;">각 번호의 요청·응답·상태 변화</h3>
+<ol style="padding-left:22px;"><li><strong>Query normalization:</strong> Timestamp timezone, casts, null semantics를 정규화한다. 이때 원래 predicate와 pushdown 가능한 predicate를 분리한다.</li><li><strong>Snapshot 고정:</strong> File list와 schema version을 한 시점으로 고정한다. Listing 도중 새 file이 보이면 partial snapshot이 될 수 있다.</li><li><strong>Metadata 읽기:</strong> Parquet은 footer tail, ORC는 postscript/footer/stripe metadata를 통해 layout directory를 얻는다. Offset은 metadata가 소유한다.</li><li><strong>Skip 결정:</strong> Statistics가 predicate와 겹치지 않으면 skip한다. 겹치거나 metadata가 없으면 READ가 안전한 기본값이다.</li><li><strong>Range plan:</strong> 인접한 작은 ranges를 합치되 불필요한 bytes와 request 수의 trade-off를 계산한다.</li><li><strong>Decode:</strong> Compression 해제 후 encoding과 nested levels/streams를 해석한다. Dictionary page나 parent levels를 누락하면 projected leaf도 복원할 수 없다.</li><li><strong>성공 확정:</strong> Candidate rows에 predicate를 다시 적용하고 counts·offsets·schema·checksum/length 불변식을 통과한 batch만 반환한다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#126246;">4.1 Pruning은 구간 논리다</h3>
+<p>Predicate <code>id BETWEEN 4 AND 7</code>과 block statistics <code>[min,max]</code>가 겹치지 않으면 block을 skip한다. <code>max&lt;4 OR min&gt;7</code>일 때만 불가능함을 증명한다. Min/max가 겹쳐도 matching row가 있다는 뜻은 아니므로 실제 values를 읽어 재검증한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.2 False positive는 비용, false negative는 correctness</h3>
+<p>Bloom filter가 “있을 수 있음”이라고 답해 불필요한 stripe를 읽는 false positive는 성능 비용이다. 실제 값이 있는데 “없음”이라 답하는 false negative는 결과 누락이므로 허용할 수 없다. Corrupt·unsupported metadata는 SKIP이 아니라 READ 또는 quarantine으로 내려야 한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.3 Range coalescing은 I/O와 over-read의 균형</h3>
+<p>Ranges 100개를 각각 4 KB로 요청하면 400 KB만 읽지만 100회 latency를 낸다. 1 MB window로 병합하면 request는 줄지만 필요 없는 bytes를 읽는다. Storage latency, bandwidth, request charge, cache reuse를 합친 비용함수로 gap threshold를 정한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.4 Decode는 CPU·cache 문제다</h3>
+<p>Compressed bytes가 작아도 dictionary lookup, bit unpacking, RLE, definition/repetition levels, UTF-8 validation과 nested offsets 생성이 CPU를 사용한다. Vectorized reader는 연속 buffers와 validity bitmaps를 사용해 branch misprediction과 per-row allocation을 줄인다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.5 Late materialization은 선택도가 높을 때 유리하다</h3>
+<p>Filter column을 먼저 읽어 selection vector를 만들면 wide payload를 surviving rows에만 materialize할 수 있다. 하지만 다른 columns가 별도 remote ranges에 있고 선택도가 낮다면 추가 pass와 random I/O가 오히려 비싸다. Early/late 선택은 row width·selectivity·range locality·cache pressure로 결정한다.</p>
+
+<h3 style="font-size:18px;color:#126246;">4.6 Nested projection에도 structure bytes가 필요하다</h3>
+<p><code>tags.list.element</code> values만으로 null list, empty list, null element와 row boundaries를 복원할 수 없다. Parquet definition/repetition levels 또는 ORC length/present streams와 parent state가 필요하다. “한 leaf만 projection” 비용에는 structure decode와 offsets 생성이 포함된다.</p>
+
+<h3 style="font-size:18px;color:#126246;">상태 소유자·불변식·성공 시점</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:27%;">상태</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">소유자와 불변식</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Snapshot/file set</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Table metadata가 소유한다. Query 동안 immutable해야 하며 partial listing과 섞이지 않는다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Schema mapping</strong></td><td style="padding:8px;border:1px solid #d9e6df;">File footer와 engine resolver가 소유한다. Name/field ID/type/nullability가 합의되어야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Skip decision</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Planner가 소유한다. 불가능함을 증명할 때만 SKIP하며 unknown은 READ다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Range plan</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Reader가 offsets와 lengths로 만든다. File bounds·overlap·dictionary/structure dependencies를 검증한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Decode state</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Page/stream decoder가 소유한다. Declared counts와 실제 소비 counts, levels와 values가 일치해야 한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Success</strong></td><td style="padding:8px;border:1px solid #d9e6df;">실제 predicate 재검증, row count/order, nested offsets, schema와 error policy가 확정된 뒤 batch를 반환한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:28%;">결정</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">판단 기준과 이유</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Row group/stripe 크기</strong></td><td style="padding:8px;border:1px solid #d9e6df;">크면 compression·sequential I/O가 좋고 metadata가 작다. 작으면 pruning granularity가 좋지만 footer/index와 task 수가 늘어난다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Sort/clustering</strong></td><td style="padding:8px;border:1px solid #d9e6df;">자주 쓰는 selective predicate의 값 범위를 block별로 좁혀 min/max pruning 효율을 높인다. Write amplification과 다른 query의 locality를 함께 본다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Bloom filter</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Equality lookup이 잦고 cardinality·bits/value 예산이 맞을 때 사용한다. Range query에는 min/max가 더 직접적이다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Page index</strong></td><td style="padding:8px;border:1px solid #d9e6df;">큰 row groups 안에서 page skip 가치가 request/metadata/decode 비용보다 큰지 engine support와 함께 확인한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Range 병합</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Object-store p50/p99 latency, bandwidth, request price, gaps와 cache hit를 측정해 threshold를 정한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;"><strong>Late materialization</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Wide rows·높은 filter selectivity에서 유리하다. 낮은 selectivity와 remote noncontiguous columns에서는 early batch가 나을 수 있다.</td></tr>
+</table>
+<h3 style="font-size:18px;color:#126246;">Best practice·anti-pattern·edge case·engine 차이</h3>
+<ul style="padding-left:22px;"><li><strong>Best:</strong> scanned files/row groups/stripes/pages, requested/received bytes, range count, decompression/decoding CPU, output rows를 단계별 metric으로 남긴다.</li><li><strong>Best:</strong> Full scan과 pruned scan의 result hash를 golden query로 비교해 optimization이 correctness를 바꾸지 않음을 검증한다.</li><li><strong>Best:</strong> Metadata missing/corrupt/unsupported는 READ 또는 quarantine으로 명시한다.</li><li><strong>Anti-pattern:</strong> “Statistics가 겹친다”를 “matching row가 있다”로 해석한다.</li><li><strong>Anti-pattern:</strong> Bytes만 최소화하고 수천 개의 tiny Range GET을 만든다.</li><li><strong>Anti-pattern:</strong> <code>CAST(column)</code>, timezone conversion, UDF가 pushdown되는지 확인하지 않고 pruning을 기대한다.</li><li><strong>Edge:</strong> NaN, signed zero, truncated string statistics, null-only blocks, missing Bloom, encrypted metadata와 schema evolution은 보수적 fallback이 필요하다.</li><li><strong>Engine:</strong> Parquet page index, Bloom filter, nested predicate, ORC row index 사용 여부와 default batch/range coalescing은 engine·version별로 다르다. Query plan과 metrics로 확인한다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;width:31%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #d9e6df;">Selective query가 full scan, Range GET 폭증, CPU 100%·I/O idle, 결과 누락, nested rows 엇갈림, 특정 file/engine에서 corrupt·OOM·timeout.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #d9e6df;">Query plan과 normalized predicate, snapshot/file versions, footer/postscript/schema, block/page statistics·Bloom, selected/skipped counts, range offsets/lengths/request latency, bytes requested/received, decompress/decode CPU, output row hash, engine/writer versions.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #d9e6df;">Predicate pushdown 불가, stale/corrupt statistics, schema mapping·timezone 오류, page index 미지원, unsorted data, tiny ranges, dictionary/levels 누락, partial footer, small-file 폭증, false-negative bug.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #d9e6df;">Affected snapshot을 고정하고 pruning을 끈 full read와 결과 hash를 비교한다. Missing/unknown metadata는 READ로 강제하고 최소 file·row group·predicate를 격리한다. Corrupt file은 quarantine한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">rollback/복구</td><td style="padding:10px;border:1px solid #d9e6df;">Last-known-good engine/config/snapshot으로 rollback한다. Source data에서 immutable rewrite 후 counts·hash·statistics·footer bounds를 검증하고 atomic snapshot으로 교체한다. Small files는 별도 compaction commit으로 수렴시킨다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #d9e6df;background:#f7faf8;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #d9e6df;">증거 없이 statistics 재작성, corrupt block skip 후 성공 처리, unknown을 SKIP으로 간주, bad object overwrite, partial output publish, 결과 누락을 성능 개선으로 해석, 원본 없이 metadata patch를 하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">7. 35분 실습: selective read planner를 손으로 그린 뒤 실행</h2>
+<p><strong>목표:</strong> 표준 Python만으로 synthetic row-group metadata를 pruning하고, 인접 byte ranges를 병합하며, corrupt metadata에서 READ fallback이 false negative를 막는지 확인한다. 실제 Parquet parser가 아니라 read-plan 불변식 simulator다.</p>
+<p><strong>사전 조건:</strong> Python 3.9 이상. 외부 package·Docker·파일이 필요 없다.</p>
+<p><strong>실행 전 예측:</strong> <code>id BETWEEN 4 AND 7</code>은 어떤 groups를 READ하는가? Group 1의 id metadata가 없어지면 SKIP인가 READ인가? Gap 32 bytes 이하를 합치면 Range GET 수는 몇 개가 되는가?</p>
+<div style="background:#15211c;color:#e8f5ef;padding:15px;margin:12px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;"><code>python3 - &lt;&lt;'PY'
+groups = [
+    {"rg":0, "id_stats":(0,3),  "ranges":[(100,180),(200,250)]},
+    {"rg":1, "id_stats":(4,7),  "ranges":[(300,390),(410,470)]},
+    {"rg":2, "id_stats":(8,11), "ranges":[(520,600),(900,960)]},
+]
+low, high = 4, 7
+
+def decision(stats):
+    if stats is None:
+        return "READ"          # unknown은 safe fallback
+    minimum, maximum = stats
+    return "SKIP" if maximum &lt; low or minimum &gt; high else "READ"
+
+def coalesce(ranges, max_gap=32):
+    out = []
+    for start, end in sorted(ranges):
+        assert 0 &lt;= start &lt; end
+        if out and start - out[-1][1] &lt;= max_gap:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+plan = [(g["rg"], decision(g["id_stats"])) for g in groups]
+selected = [g for g in groups if decision(g["id_stats"]) == "READ"]
+ranges = coalesce([r for g in selected for r in g["ranges"]])
+print("plan=", plan)
+print("selected=", [g["rg"] for g in selected])
+print("ranges=", ranges)
+assert plan == [(0,"SKIP"),(1,"READ"),(2,"SKIP")]
+assert ranges == [(300,470)]
+
+# Failure injection: matching group의 statistics가 손실됨.
+damaged = [dict(g) for g in groups]
+damaged[1]["id_stats"] = None
+damaged_plan = [(g["rg"], decision(g["id_stats"])) for g in damaged]
+print("damaged_plan=", damaged_plan)
+assert damaged_plan[1] == (1,"READ")
+print("SAFE_FALLBACK: unknown metadata did not cause false-negative skip")
+PY</code></div>
+<p><strong>예상 관찰:</strong> 정상 plan은 RG0·RG2를 SKIP하고 RG1만 READ한다. RG1의 두 ranges는 gap 20이므로 <code>(300,470)</code> 하나로 병합된다. Metadata가 사라져도 RG1은 READ라서 결과 누락을 만들지 않는다.</p>
+<h3 style="font-size:18px;color:#126246;">실패 주입·자주 나는 오류·cleanup</h3>
+<ul style="padding-left:22px;"><li><strong>실패 주입:</strong> 실제 matching group의 statistics를 <code>None</code>으로 바꾼다.</li><li><strong>오류:</strong> Metadata 없음은 “matching row 없음”이 아니다. Unknown은 READ다.</li><li><strong>오류:</strong> Range end를 inclusive로 혼동하지 않는다. 실습 ranges는 반열린 구간 <code>[start,end)</code>다.</li><li><strong>오류:</strong> Range 병합은 bytes만 늘리는 게 아니라 requests를 줄인다. 두 비용을 함께 계산한다.</li><li><strong>해결:</strong> <code>max_gap</code>을 p99 request latency·bandwidth·request charge로 튜닝하고 golden result hash로 검증한다.</li><li><strong>Cleanup:</strong> Memory object만 사용하므로 생성 파일·package·container가 없다.</li></ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;"><li>Projection pruning과 predicate pruning은 별개이며 둘 다 plan에 보여야 한다.</li><li>Statistics가 겹치는 것은 후보라는 뜻이지 match 확정이 아니다.</li><li>Missing·corrupt·unsupported metadata는 SKIP이 아니라 READ 또는 quarantine이다.</li><li>Partition/file/block/page pruning은 서로 다른 granularities와 costs를 가진다.</li><li>Page index가 file에 있어도 engine이 실제로 사용하지 않을 수 있다.</li><li>최소 bytes가 최소 latency는 아니다. Tiny ranges는 request 비용을 폭증시킨다.</li><li>Nested leaf projection에도 levels/present/length streams와 parent offsets가 필요하다.</li><li>Dictionary와 structure streams를 range plan에서 빼면 decode가 실패하거나 의미가 깨진다.</li><li>Pruning 후에도 실제 values에 predicate를 다시 적용해야 한다.</li><li>Optimization은 full scan과 result hash가 같을 때만 성공이다.</li></ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#126246;">Q1. 1 TB Parquet table에서 1% 날짜와 2 columns를 읽는 path를 설계하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Snapshot과 schema를 고정한다 → partition/file pruning → footer tail read → row-group/page statistics로 safe skip → 필요한 column chunks와 dictionary/levels ranges → range coalescing → vectorized decode/late materialization → 실제 predicate 재검증 → files/bytes/ranges/CPU/output rows metrics와 full-scan hash 비교까지 설명한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q2. Bytes는 90% 줄었는데 query가 더 느려졌습니다. 왜입니까?</h3>
+<p><strong>좋은 답변 구조:</strong> Baseline 수치(bytes, requests, p50/p99 latency, CPU)를 요구한다 → tiny Range GET·TLS/request charge·cache miss·두 번 decode·selection vector·low selectivity 가설 → ranges 병합 threshold와 early/late materialization A/B → 비용함수와 결과 동일성으로 결정한다.</p>
+<h3 style="font-size:18px;color:#126246;">Q3. Metadata pruning이 결과를 누락시킨 의심이 있습니다. 대응하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> Affected snapshot·engine/version·file checksum을 고정한다 → pruning off full scan과 result hash 비교 → 최소 predicate/file/block 격리 → statistics/Bloom/schema/timezone/cast/NaN 가설 → unknown=READ와 quarantine → last-good rollback → immutable rewrite·atomic publish·false-negative regression test를 제시한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+<h3 style="font-size:18px;color:#126246;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Parquet file 끝 8 bytes는 footer 위치를 어떻게 알려 주는가?</li><li>Row-group statistics로 <code>id 4~7</code> 후보를 고를 때 어떤 비교를 하는가?</li><li>Column chunk의 실제 byte range를 만들 때 어떤 offset과 size를 사용했는가?</li></ol>
+<h3 style="font-size:18px;color:#126246;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Selective read의 control path와 data path를 각각 순서대로 말하라.</li><li>Metadata가 없거나 corrupt일 때 SKIP이 위험한 이유와 안전한 상태 전이를 설명하라.</li><li>최소 bytes plan과 최소 total-cost plan이 다른 예를 수치로 설명하라.</li></ol>
+<h3 style="font-size:18px;color:#126246;">짧은 정답·채점 기준</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;width:16%;"><strong>어제 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">마지막 4 bytes는 <code>PAR1</code>, 그 앞 little-endian 4 bytes는 footer length다. <code>file_size-8-footer_len</code>이 footer start다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;"><code>max&lt;4</code> 또는 <code>min&gt;7</code>이면 skip, 아니면 candidate READ다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>어제 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Dictionary page offset이 있으면 그것, 없으면 data page offset을 start로 하고 <code>total_compressed_size</code>를 더해 end를 만든다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 1</strong></td><td style="padding:8px;border:1px solid #d9e6df;">Control: query→snapshot/schema→metadata→skip/read→ranges/batch. Data: storage bytes→decompress→decode→selection/nested materialization→result.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 2</strong></td><td style="padding:8px;border:1px solid #d9e6df;">불가능함을 증명하지 못했으므로 SKIP은 false negative를 만들 수 있다. Unknown→READ, invalid→quarantine 또는 full-read fallback이 안전하다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;background:#f7faf8;"><strong>오늘 3</strong></td><td style="padding:8px;border:1px solid #d9e6df;">100×4 KB는 400 KB지만 100 requests다. 1 MB 병합 read가 latency/request charge가 큰 remote storage에서 더 빠를 수 있다.</td></tr>
+</table>
+<p><strong>채점:</strong> 각 2점, 총 12점. 10점 이상 통과. Metadata decision과 byte movement, decode·correctness·failure fallback을 한 그림으로 연결하면 면접 Level 3다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;"><li><a href="https://parquet.apache.org/docs/file-format/" style="color:#126246;">Apache Parquet — File Format</a>: File→row group→column chunk→page 계층과 metadata 기반 읽기 구조를 확인한다.</li><li><a href="https://parquet.apache.org/docs/file-format/pageindex/" style="color:#126246;">Apache Parquet — Page Index</a>: ColumnIndex·OffsetIndex로 page skip과 row range를 연결하는 계약을 확인한다.</li><li><a href="https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift" style="color:#126246;">Apache parquet-format — parquet.thrift</a>: Footer, statistics, page/column metadata의 wire contract를 확인한다.</li><li><a href="https://orc.apache.org/specification/ORCv1/" style="color:#126246;">Apache ORC Specification</a>: Stripe, index/data/footer streams와 row index·Bloom filter layout을 확인한다.</li></ul>
+<p style="font-size:14px;color:#53635c;">Format specification과 query engine의 실제 지원 범위는 같다고 가정하지 않는다. 배포 engine/version의 plan과 scan metrics로 사용 여부를 검증한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Week 5 · Day 29 — encoding과 compression 분리</strong><br>Logical values가 encoding으로 byte patterns가 된 뒤 compression으로 다시 줄어드는 두 단계와 CPU·I/O trade-off를 분리해 본다.</div>
+</td></tr><tr><td style="padding:18px 24px;background:#173c32;color:#d8eee5;font-size:13px;text-align:center;">File Format 심화 커리큘럼 · prune safely, read deliberately, verify actual rows</td></tr>
+</table></td></tr></table></body></html>
