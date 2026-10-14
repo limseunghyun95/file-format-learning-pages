@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-10-13T09:01:33+09:00",
+  "updatedAt": "2026-10-14T09:01:29+09:00",
   "lessons": [
     {
       "day": 1,
@@ -257,6 +257,15 @@
       "path": "day-28.html",
       "kind": "review",
       "publishedAt": "2026-10-13T09:01:33+09:00"
+    },
+    {
+      "day": 29,
+      "week": 5,
+      "title": "dictionary, RLE, bit packing, delta",
+      "summary": "Logical values를 dictionary ID·run·packed bits·delta로 변환하는 byte layout과 adaptive fallback, CPU·I/O·cache trade-off를 학습합니다.",
+      "path": "day-29.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-14T09:01:29+09:00"
     }
   ]
 }

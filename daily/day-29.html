@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 29</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 5 / DAY 29 · ENCODING</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">dictionary, RLE, bit packing, delta</h1><div style="font-size:15px;color:#d8eee5;">논리값을 더 작은 정수·run·차이값으로 바꾸는 byte layout · 예상 학습 60분 + 실습 30분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>Encoding은 값을 잃지 않으면서 <strong>반복, 작은 값 범위, 순서성</strong>을 byte layout에 드러내는 변환이며, dictionary·RLE·bit packing·delta는 서로 대체재가 아니라 데이터 분포에 따라 조합되는 도구다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Logical value</strong></td><td style="padding:9px;border:1px solid #d9e6df;">사용자가 보는 값이다. 예: 문자열 <code>"KR"</code>, 정수 <code>1003</code>. 파일에는 이 의미가 아니라 이를 표현한 bytes가 저장된다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Encoding</strong></td><td style="padding:9px;border:1px solid #d9e6df;">논리값을 복원 가능한 다른 표현으로 바꾸는 규칙. 값의 반복·범위·순서를 이용해 bytes와 decode 비용을 줄인다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Compression</strong></td><td style="padding:9px;border:1px solid #d9e6df;">encoding된 byte stream을 다시 압축하는 단계다. Encoding은 값의 구조를 알고, codec은 대개 byte 패턴을 본다는 차이가 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Cardinality</strong></td><td style="padding:9px;border:1px solid #d9e6df;">전체 행 수에 비해 서로 다른 값의 수가 얼마나 많은지다. 1억 행의 국가 코드 200개는 low-cardinality다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Dictionary</strong></td><td style="padding:9px;border:1px solid #d9e6df;">중복 값을 사전에서 한 번만 저장하고 각 행은 작은 ID를 저장한다. <code>[KR,US,KR]</code> → 사전 <code>[KR,US]</code> + ID <code>[0,1,0]</code>.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>RLE</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Run-Length Encoding. 같은 값이 연속된 구간(run)을 <code>(값, 반복 횟수)</code>로 기록한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Bit packing</strong></td><td style="padding:9px;border:1px solid #d9e6df;">정수를 고정 32/64비트 대신 실제 범위에 필요한 최소 bit 폭으로 이어 붙인다. 0~7은 3비트면 충분하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Delta</strong></td><td style="padding:9px;border:1px solid #d9e6df;">현재 값 대신 이전 값과의 차이를 저장한다. 증가하는 ID·timestamp처럼 인접 차이가 작을 때 효과적이다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Page / Column chunk</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Page는 encoding·compression의 작은 실행 단위이고, 같은 column의 pages가 row group 안에서 column chunk를 이룬다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">2. 왜 중요한가</h2>
+<p>같은 logical values라도 분포와 순서에 따라 저장 bytes와 scan CPU가 크게 달라진다. Encoding이 잘 맞으면 storage·network·cache miss를 줄이고, 더 많은 값을 한 CPU cache line에 담아 vectorized scan을 돕는다. 반대로 high-cardinality 문자열에 dictionary를 강제하면 dictionary page와 ID stream을 모두 읽으면서도 이득이 사라진다.</p>
+<div style="padding:14px;background:#fff8e7;border:1px solid #f0d999;"><strong>핵심 불변식:</strong> decode(encode(values))는 원래 values와 정확히 같아야 한다. Writer가 특정 encoding을 기록했다면 reader는 page metadata의 encoding enum을 따라야 하며, 추측으로 다른 decoder를 선택하면 안 된다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;text-align:center;">
+<tr><td style="padding:12px;background:#eaf7f1;border:1px solid #9fd2bb;"><strong>① Logical column</strong><br><span style="font-size:14px;">값·null·순서·cardinality 표본</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓ control path: 통계로 encoding 선택</td></tr>
+<tr><td style="padding:12px;background:#eef4ff;border:1px solid #a9c2ee;"><strong>② Value encoding</strong><br><span style="font-size:14px;">dictionary / RLE / bit packing / delta / plain</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓ data path: encoded stream + levels</td></tr>
+<tr><td style="padding:12px;background:#f7f1ff;border:1px solid #cbb0e8;"><strong>③ Page buffer</strong><br><span style="font-size:14px;">encoding enum·counts·dictionary page 참조</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓ codec compression → storage → range read</td></tr>
+<tr><td style="padding:12px;background:#fff5ed;border:1px solid #efbd96;"><strong>④ Reader</strong><br><span style="font-size:14px;">decompress → enum별 decode → vector batch</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓</td></tr>
+<tr><td style="padding:12px;background:#eaf7f1;border:1px solid #9fd2bb;"><strong>⑤ 동일 logical values</strong><br><span style="font-size:14px;">query filter·aggregate·materialize</span></td></tr>
+</table>
+<ol style="padding-left:22px;">
+<li><strong>Writer가 상태를 소유한다.</strong> Column page 표본에서 distinct 수, 평균 run 길이, min/max, 인접 delta를 관찰하고 지원 가능한 encoding을 고른다.</li>
+<li><strong>Dictionary:</strong> dictionary page에 고유값을 PLAIN으로 저장하고 data page에는 dictionary ID를 RLE/bit-packing hybrid로 저장한다. Dictionary가 커지면 writer는 이후 page를 PLAIN으로 fallback할 수 있다.</li>
+<li><strong>RLE와 bit packing:</strong> 긴 반복은 RLE run, 짧고 범위가 작은 정수는 packed run이 유리하다. Parquet의 RLE hybrid는 두 run을 한 stream에서 섞는다.</li>
+<li><strong>Delta:</strong> 첫 값을 기록한 뒤 차이들의 최소값과 miniblock bit width를 기록한다. 일정한 증가라면 상대 delta가 0이 되어 아주 작아진다.</li>
+<li><strong>Reader가 성공을 확정한다.</strong> Page를 decompress하고 metadata에 선언된 decoder로 value count만큼 복원해 logical type을 적용했을 때 해당 batch가 사용 가능해진다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#245b4a;">Dictionary: 문자열 비교를 작은 정수로</h3>
+<p>고유값 수를 <code>D</code>라 하면 ID 폭은 대략 <code>ceil(log2(D))</code> bits다. 8개 값이면 3 bits, 256개면 8 bits다. 하지만 dictionary 자체의 bytes, offsets, hash table 구축, cache miss도 비용이다. Page 경계를 넘는 사전의 소유 범위를 reader가 혼동하면 다른 값으로 복원되는 치명적 corruption이 된다.</p>
+<h3 style="font-size:18px;color:#245b4a;">RLE와 bit packing: branch 대 density</h3>
+<p>RLE는 run 하나를 읽고 같은 값을 batch에 채우므로 긴 반복에 강하다. Bit packing은 word 단위 shift·mask 또는 SIMD 연산으로 여러 정수를 풀어내며 random-like한 작은 값에 강하다. Run이 짧으면 RLE header overhead와 branch가 늘고, bit width가 커지면 packing 이득이 줄어든다.</p>
+<h3 style="font-size:18px;color:#245b4a;">Delta: absolute magnitude가 아니라 변화량</h3>
+<p><code>[1,000,000, 1,000,001, 1,000,002]</code>는 원값은 크지만 delta가 <code>[1,1]</code>이라 작다. 정렬이 깨져 큰 jump가 많으면 bit width가 커진다. Parquet의 DELTA_BINARY_PACKED는 block 안의 최소 delta를 빼고 miniblock별 bit width로 상대 delta를 pack한다.</p>
+<h3 style="font-size:18px;color:#245b4a;">Encoding과 compression의 경계</h3>
+<p>Data path는 <strong>logical values → encode → page bytes → compress</strong> 순서다. Reader는 반대로 <strong>range read → decompress → decode</strong>한다. Encoding은 값의 type·분포를 활용하고, Snappy·ZSTD 같은 codec은 결과 bytes의 반복 패턴을 활용한다. 둘의 효과는 독립적이지 않으므로 최종 파일과 실제 query로 함께 측정해야 한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:24%;">관찰</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:25%;">후보</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">판단 이유·주의점</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">낮은 cardinality 문자열</td><td style="padding:8px;border:1px solid #d9e6df;">Dictionary + ID RLE/packing</td><td style="padding:8px;border:1px solid #d9e6df;">중복값 bytes를 제거한다. 고유값 급증과 dictionary fallback 지점을 관찰한다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">정렬되어 긴 반복</td><td style="padding:8px;border:1px solid #d9e6df;">RLE</td><td style="padding:8px;border:1px solid #d9e6df;">평균 run 길이가 핵심이다. 같은 cardinality라도 섞인 순서는 불리하다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">작은 정수 범위</td><td style="padding:8px;border:1px solid #d9e6df;">Bit packing</td><td style="padding:8px;border:1px solid #d9e6df;">최대값이 bit width를 결정한다. 드문 큰 outlier가 page 전체 폭을 키울 수 있다.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">증가 ID·timestamp</td><td style="padding:8px;border:1px solid #d9e6df;">Delta + packing</td><td style="padding:8px;border:1px solid #d9e6df;">인접 차이가 작고 안정적일수록 좋다. 정렬 비용과 query pruning 효과도 함께 본다.</td></tr>
+</table>
+<ul style="padding-left:22px;">
+<li><strong>Best practice:</strong> dataset 전체 평균이 아니라 page/column chunk 단위 분포를 측정하고, bytes/value·decode rows/s·CPU cycles·peak memory를 함께 기록한다.</li>
+<li><strong>Anti-pattern:</strong> “문자열이면 dictionary”처럼 type만 보고 강제한다. UUID·고유 URL은 dictionary가 원본보다 커질 수 있다.</li>
+<li><strong>Edge case:</strong> null은 value stream과 별도의 definition/present stream으로 표현될 수 있다. Null 수와 value count를 혼동하면 decode 위치가 밀린다.</li>
+<li><strong>Version/engine 차이:</strong> Parquet의 독립 <code>BIT_PACKED</code> enum은 deprecated이며, 현재의 dictionary IDs와 levels는 RLE/bit-packing hybrid 문맥을 구분해야 한다. DELTA_* 또는 새 encoding은 reader 지원표를 확인한다.</li>
+<li><strong>Format 차이:</strong> ORC도 dictionary/direct 선택과 RLE를 사용하지만 stream 구조와 RLE 버전이 Parquet과 다르다. 이름이 같다고 byte layout이 호환되는 것은 아니다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">6. 장애 대응 표</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:30%;">순서</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;">High-cardinality dictionary 강제로 파일·scan 비용이 급증한 경우</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>① 증상</strong></td><td style="padding:9px;border:1px solid #d9e6df;">파일 크기 증가, writer memory spike, dictionary fallback 증가, scan CPU와 latency 상승.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>② 먼저 수집할 증거/지표</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Column별 distinct ratio, dictionary page bytes, encoding 목록, fallback page 수, compressed/uncompressed bytes, decode throughput, writer peak RSS.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>③ 가능한 가설</strong></td><td style="padding:9px;border:1px solid #d9e6df;">UUID 같은 거의 고유한 값, page가 너무 커 사전 비대화, engine의 dictionary threshold 차이, data 정렬 변화.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>④ 안전한 첫 조치</strong></td><td style="padding:9px;border:1px solid #d9e6df;">원본은 보존하고 작은 representative partition을 dictionary off/auto로 재작성해 동일 query와 checksum을 비교한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>⑤ rollback/복구</strong></td><td style="padding:9px;border:1px solid #d9e6df;">새 파일을 별도 경로에 쓰고 row count·null count·hash·reader 호환성을 검증한 뒤 metadata pointer를 원자적으로 전환한다. 실패하면 이전 snapshot을 유지한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>⑥ 하지 말아야 할 조치</strong></td><td style="padding:9px;border:1px solid #d9e6df;">원본 파일을 in-place 수정하거나, 크기만 보고 전체 dataset을 즉시 재작성하거나, reader 호환성 확인 없이 새 encoding을 강제하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">7. 30분 실습: 분포가 encoding 선택을 뒤집는 순간</h2>
+<p><strong>사전 조건:</strong> Python 3 표준 라이브러리만 필요하다. 아래 계산은 Parquet 파일 writer가 아니라 각 encoding의 선택 신호와 대략적 payload bits를 비교하는 재현 모델이다.</p>
+<p><strong>먼저 예측:</strong> (1) 반복된 country는 dictionary와 RLE이 작다. (2) 섞인 0~7은 RLE보다 3-bit packing이 낫다. (3) 증가 ID는 delta 폭이 작다. (4) 고유 문자열은 dictionary overhead가 plain보다 커진다.</p>
+<div style="background:#14231e;color:#e8fff5;padding:14px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;">python3 - &lt;&lt;'PY'
+import math
+
+def bits_needed(max_value):
+    return max(1, max_value.bit_length())
+
+def dictionary_cost(values):
+    dictionary = list(dict.fromkeys(values))
+    ids = {v: i for i, v in enumerate(dictionary)}
+    width = bits_needed(len(dictionary) - 1)
+    payload = sum(len(v.encode()) * 8 for v in dictionary)
+    return payload + len(values) * width, len(dictionary), width
+
+def rle_cost(values):
+    runs = 1 + sum(a != b for a, b in zip(values, values[1:]))
+    width = bits_needed(max(values))
+    return runs * (8 + width), runs
+
+def packed_cost(values):
+    width = bits_needed(max(values))
+    return len(values) * width, width
+
+def delta_cost(values):
+    deltas = [b - a for a, b in zip(values, values[1:])]
+    shifted = [d - min(deltas) for d in deltas]
+    width = bits_needed(max(shifted, default=0))
+    return 64 + len(shifted) * width, width
+
+country = ["KR"] * 32 + ["US"] * 16
+mixed = [i % 8 for i in range(48)]
+ids = [1_000_000 + i for i in range(48)]
+unique = [f"user-{i:03d}" for i in range(48)]
+
+print("country_dictionary(bits, distinct, id_width)=", dictionary_cost(country))
+print("sorted_country_id_rle(bits, runs)=", rle_cost([0] * 32 + [1] * 16))
+print("mixed_rle(bits, runs)=", rle_cost(mixed))
+print("mixed_pack(bits, width)=", packed_cost(mixed))
+print("ids_delta(bits, width)=", delta_cost(ids))
+
+dict_bits, distinct, width = dictionary_cost(unique)
+plain_bits = sum(len(v.encode()) * 8 for v in unique)
+print("failure_high_cardinality=", {"plain": plain_bits, "dictionary": dict_bits})
+assert dict_bits &gt; plain_bits
+print("SAFE_FALLBACK: choose plain/auto, preserve original")
+PY</div>
+<p><strong>예상 관찰:</strong> country dictionary는 distinct 2와 1-bit ID, 정렬된 ID는 run 2개다. Mixed 값은 run 48개라 RLE가 불리하지만 packing은 3 bits/value다. 연속 ID의 relative delta는 0이라 폭이 최소다. 고유 문자열의 dictionary는 ID stream만큼 plain보다 커진다.</p>
+<p><strong>실패 주입:</strong> 마지막 <code>unique</code> 데이터가 high-cardinality 강제 dictionary 상황이다. Assertion은 비효율을 검출하고 PLAIN/auto fallback을 선택하게 한다.</p>
+<p><strong>자주 나는 오류와 해결:</strong> 음수 delta에 단순 <code>bit_length</code>를 쓰지 말고 minimum delta나 zigzag 규칙을 적용한다. 이 실습의 bits는 header·alignment를 단순화한 모델이므로 실제 파일 크기로 오해하지 않는다.</p>
+<p><strong>Cleanup:</strong> heredoc은 파일을 만들지 않으므로 삭제할 것이 없다. 파일로 저장했다면 본인이 만든 실습 파일만 제거한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px;">
+<li>Dictionary와 compression을 같은 말로 부르지 않는다. Dictionary ID stream도 다시 codec 압축될 수 있다.</li>
+<li>Cardinality만 보지 않는다. RLE는 값 종류보다 <strong>연속 run 길이</strong>, delta는 전체 범위보다 <strong>인접 차이</strong>가 중요하다.</li>
+<li>독립 BIT_PACKED enum과 RLE hybrid 안의 bit-packed run을 구분한다.</li>
+<li>Writer가 page 중간에 임의로 decoder contract를 바꾸지 않도록 page metadata와 fallback 경계를 검증한다.</li>
+<li>압축률이 좋아도 decode CPU·temporary buffer·cache behavior가 나쁘면 query 비용은 커질 수 있다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<p><strong>Q1. 10억 행의 country_code와 UUID column에 encoding을 각각 설계하라.</strong><br><strong>좋은 답변 구조:</strong> distinct ratio·평균 길이·정렬성 가정 → country dictionary와 ID RLE/packing → UUID의 plain/direct 후보 → page 단위 fallback → bytes/value·decode throughput·memory 측정 → 호환 reader 확인.</p>
+<p><strong>Q2. Dictionary를 켰는데 파일이 커졌다. 원인과 안전한 변경 절차는?</strong><br><strong>좋은 답변 구조:</strong> 증상 수치화 → dictionary page와 ID overhead → cardinality·page size·fallback 가설 → representative A/B rewrite → logical equality 검증 → 새 경로 publish와 metadata 전환 → 이전 snapshot rollback.</p>
+<p><strong>Q3. RLE, bit packing, delta 중 하나만 고르라는 요구를 어떻게 반박할 것인가?</strong><br><strong>좋은 답변 구조:</strong> 세 방식의 데이터 가정 → column/page마다 분포가 다름 → hybrid와 adaptive 선택의 내부 흐름 → branch·SIMD·cache·I/O trade-off → engine 지원 한계 → 실제 workload benchmark로 결정.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">10. 복습 문제와 정답</h2>
+<h3 style="font-size:18px;color:#245b4a;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Selective query의 control path와 data path를 한 문장씩 설명하라.</li><li>Metadata가 없거나 신뢰할 수 없을 때 SKIP 대신 READ해야 하는 이유는?</li><li>Late materialization은 어떤 columns를 먼저 decode하는가?</li></ol>
+<h3 style="font-size:18px;color:#245b4a;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Dictionary가 유리한 조건과 손해인 조건을 각각 말하라.</li><li>값 범위가 0~31이면 최소 bit width는 몇 bit인가?</li><li>증가 timestamp에서 delta가 유리한 이유와 실패 조건은?</li></ol>
+<div style="padding:15px;background:#eef4ff;border:1px solid #b7caeb;"><strong>짧은 정답·채점 기준</strong><br>어제 1: metadata로 읽을 범위를 결정 / 선택 bytes를 읽고 decode·materialize. 2: 잘못된 SKIP은 false negative로 정답 행을 잃기 때문. 3: filter columns 먼저.<br>오늘 1: 낮은 cardinality·반복이면 유리, 거의 고유하거나 사전 overhead가 크면 손해. 2: 5 bit. 3: 인접 차이가 작아 packing 폭이 줄며, 순서가 깨져 큰 jump가 많으면 이득 감소.<br><strong>채점:</strong> 각 문항 2점. 정의 1점 + 조건·trade-off 1점, 총 12점 중 9점 이상이면 통과.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://github.com/apache/parquet-format/blob/master/Encodings.md" style="color:#0c7653;">Apache Parquet encoding definitions</a> — dictionary, RLE/bit-packing hybrid, DELTA_*의 공식 byte layout.</li>
+<li><a href="https://parquet.apache.org/docs/file-format/versions/" style="color:#0c7653;">Apache Parquet format versions</a> — encoding과 reader 호환성 경계.</li>
+<li><a href="https://parquet.apache.org/docs/file-format/implementationstatus/" style="color:#0c7653;">Apache Parquet implementation status</a> — engine별 read/write 지원을 확인할 때 사용.</li>
+<li><a href="https://orc.apache.org/specification/ORCv1/" style="color:#0c7653;">Apache ORC Specification v1</a> — ORC dictionary/direct stream과 RLEv2 비교 자료.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Day 30 · Snappy, ZSTD, Gzip, LZ4 특성</strong><br>오늘 만든 encoded bytes에 codec을 적용하고 압축률·decode CPU·network I/O·호환성을 workload 기준으로 비교한다.</div>
+</td></tr></table></td></tr></table>
+</body>
+</html>
