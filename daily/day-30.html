@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File Format 심화 커리큘럼 Day 30</title></head>
+<body style="margin:0;padding:0;background:#f4f8f6;color:#1c2924;font-family:Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;font-size:16px;line-height:1.72;word-break:keep-all;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f4f8f6;table-layout:fixed;"><tr><td align="center" style="padding:20px 10px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #d9e6df;border-collapse:separate;table-layout:fixed;">
+<tr><td style="padding:26px 24px;background:#173c32;color:#ffffff;"><div style="font-size:13px;font-weight:700;letter-spacing:1.2px;color:#bfe9d7;">FILE FORMAT · WEEK 5 / DAY 30 · COMPRESSION</div><h1 style="margin:8px 0;font-size:27px;line-height:1.32;color:#ffffff;">Snappy, ZSTD, Gzip, LZ4 특성</h1><div style="font-size:15px;color:#d8eee5;">압축률이 아니라 end-to-end query cost로 codec 선택하기 · 예상 학습 60분 + 실습 35분</div></td></tr>
+<tr><td style="padding:24px;">
+<div style="padding:16px;background:#eaf7f1;border-left:5px solid #15956b;margin-bottom:26px;"><strong>한 줄 요약</strong><br>Codec 선택은 “가장 작은 파일” 찾기가 아니라 <strong>encoding된 page를 얼마나 적은 CPU·I/O·memory·호환성 비용으로 저장하고 다시 읽을지</strong> 결정하는 workload별 최적화다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:0 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;width:30%;">용어</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;text-align:left;">쉬운 설명과 정확한 정의</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Codec</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Compressor와 decompressor가 합의한 byte 변환 규칙이다. 같은 이름이라도 framing 규격이 다르면 호환되지 않을 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Compression ratio</strong></td><td style="padding:9px;border:1px solid #d9e6df;">원본 bytes ÷ 압축 bytes. 값이 클수록 작아졌지만 CPU 시간과 latency는 말해 주지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Throughput</strong></td><td style="padding:9px;border:1px solid #d9e6df;">초당 처리한 bytes. Write에는 압축 throughput, scan에는 압축 해제 throughput이 중요하다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Latency</strong></td><td style="padding:9px;border:1px solid #d9e6df;">요청 시작부터 결과가 나올 때까지 시간. 평균뿐 아니라 p95·p99 tail latency도 본다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Framing</strong></td><td style="padding:9px;border:1px solid #d9e6df;">압축 block의 경계·길이·검증 정보를 감싸는 규칙. 알고리즘이 같아도 frame이 다르면 reader가 해석하지 못한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Page</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Parquet에서 encoding·compression의 작은 단위다. Page header는 압축 전후 크기와 page 종류를 알려 준다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Range read</strong></td><td style="padding:9px;border:1px solid #d9e6df;">파일 전체가 아니라 offset과 length로 필요한 byte 구간만 읽는 I/O다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>Working set</strong></td><td style="padding:9px;border:1px solid #d9e6df;">동시에 memory·CPU cache에서 다루는 데이터의 양. 압축 page와 해제 buffer가 함께 존재할 수 있다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">2. 왜 중요한가</h2>
+<p>Object storage에서 1GB를 덜 읽으면 network 시간과 요청 비용이 줄지만, 이를 위해 CPU를 과도하게 쓰면 동시 query 수가 떨어진다. 반대로 빠른 codec으로 파일이 커지면 cache hit가 낮아지고 remote I/O가 병목이 된다. 따라서 codec은 storage, network, CPU, memory를 서로 교환하는 설계 knob다.</p>
+<div style="padding:14px;background:#fff8e7;border:1px solid #f0d999;"><strong>핵심 불변식:</strong> decompress(compress(encoded_page))는 입력 encoded bytes와 정확히 같아야 한다. Writer가 footer·column metadata에 기록한 codec enum, page header의 압축 전후 크기, 실제 payload framing이 모두 일치해야 reader 성공을 확정할 수 있다.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;text-align:center;">
+<tr><td style="padding:12px;background:#eaf7f1;border:1px solid #9fd2bb;"><strong>① Logical values → Encoding</strong><br><span style="font-size:14px;">dictionary·RLE·bit packing·delta로 page bytes 생성</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓ control path: codec·level·page size 선택</td></tr>
+<tr><td style="padding:12px;background:#eef4ff;border:1px solid #a9c2ee;"><strong>② Page compressor</strong><br><span style="font-size:14px;">Snappy / ZSTD / Gzip / LZ4_RAW</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓ data path: compressed payload + size metadata</td></tr>
+<tr><td style="padding:12px;background:#f7f1ff;border:1px solid #cbb0e8;"><strong>③ Storage commit</strong><br><span style="font-size:14px;">pages → column chunk → row group → footer → publish</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓ footer read → pruning → selected range GET</td></tr>
+<tr><td style="padding:12px;background:#fff5ed;border:1px solid #efbd96;"><strong>④ Reader buffers</strong><br><span style="font-size:14px;">compressed input → decompress → encoded bytes</span></td></tr>
+<tr><td style="font-size:22px;color:#15956b;">↓ decode → vector batch</td></tr>
+<tr><td style="padding:12px;background:#eaf7f1;border:1px solid #9fd2bb;"><strong>⑤ 동일 logical values</strong><br><span style="font-size:14px;">filter·aggregate·materialize</span></td></tr>
+</table>
+<ol style="padding-left:22px;">
+<li><strong>Writer가 선택 상태를 소유한다.</strong> Data 분포, CPU budget, reader fleet 지원, I/O 가격을 기준으로 codec과 level을 고른다.</li>
+<li><strong>Encoding 후 compression한다.</strong> Dictionary ID나 delta처럼 이미 구조화된 bytes를 codec이 다시 압축한다. 두 단계의 효과는 독립적이지 않다.</li>
+<li><strong>Page 단위로 기록한다.</strong> Parquet는 page data block을 압축하고 PageHeader의 compressed/uncompressed size와 column metadata의 codec을 남긴다.</li>
+<li><strong>Commit 시점은 파일 전체다.</strong> 모든 pages와 footer가 durable하고 catalog/snapshot이 완성 파일을 가리킬 때 publish가 성공한다. Footer 전 write crash는 partial file이다.</li>
+<li><strong>Reader는 역순으로 검증한다.</strong> Footer로 codec을 확인하고 필요한 ranges만 읽어 buffer 크기를 제한한 뒤 decompress·decode한다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">4. CS 내부 동작</h2>
+<h3 style="font-size:18px;color:#245b4a;">Snappy: speed-first baseline</h3>
+<p>일반적으로 압축·해제 속도가 빠르고 CPU 사용이 예측 가능해 interactive scan과 범용 default에 자주 쓰인다. 압축률은 ZSTD·Gzip보다 낮을 수 있으므로 remote I/O가 비싼 workload에서는 전체 시간이 더 길어질 수 있다. “항상 가장 빠르다”가 아니라 실제 hardware와 data로 확인한다.</p>
+<h3 style="font-size:18px;color:#245b4a;">ZSTD: level로 CPU와 ratio를 조절</h3>
+<p>ZSTD는 여러 compression level을 제공해 ratio와 write CPU를 조절할 수 있다. 낮은 level은 read-heavy lake의 좋은 균형점이 될 수 있지만, level을 올려도 decompress 비용·파일 크기 이득이 workload 전체 비용을 개선하는지 측정해야 한다. Reader fleet가 ZSTD를 지원하는지도 먼저 확인한다.</p>
+<h3 style="font-size:18px;color:#245b4a;">Gzip: 높은 보급성과 CPU trade-off</h3>
+<p>Gzip은 오래된 reader까지 넓게 지원되는 편이고 높은 압축률을 줄 수 있지만, 압축·해제 CPU가 speed-first codec보다 클 수 있다. Parquet 규격의 GZIP은 RFC 1952 framing이며 zlib 또는 raw deflate와 같은 이름으로 취급하면 안 된다. 여러 GZIP member를 쓰는 page는 reader 호환성도 주의한다.</p>
+<h3 style="font-size:18px;color:#245b4a;">LZ4: 빠른 block 처리와 framing 함정</h3>
+<p>LZ4는 빠른 압축·해제를 목표로 하며 CPU-bound scan에 유리할 수 있다. 그러나 Parquet의 과거 <code>LZ4</code> enum은 undocumented Hadoop framing 때문에 deprecated다. 새 writer는 상호운용 가능한 <code>LZ4_RAW</code> 지원을 확인해야 하며, “LZ4 알고리즘 지원”만으로 파일 호환성을 단정하면 안 된다.</p>
+<h3 style="font-size:18px;color:#245b4a;">CPU·I/O·cache cost 식</h3>
+<div style="padding:14px;background:#eef4ff;border:1px solid #b7caeb;font-family:Menlo,Consolas,monospace;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;">scan_time ≈ metadata + remote_I/O(compressed_bytes) + decompress_CPU + decode_CPU + materialize
+working_set ≈ compressed_input + uncompressed_page + decoded_vectors</div>
+<p>Compression ratio가 좋아지면 I/O는 줄지만 decompression CPU와 temporary buffer pressure가 늘 수 있다. 작은 page는 random access와 cache locality를 돕지만 header·codec 호출 overhead가 늘고, 큰 page는 ratio가 좋아질 수 있으나 selective read와 tail latency가 나빠질 수 있다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px;">
+<tr><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:22%;">상황</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:22%;">첫 후보</th><th style="padding:8px;border:1px solid #d9e6df;background:#173c32;color:#fff;">판단 이유와 검증</th></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Interactive·CPU 여유 적음</td><td style="padding:8px;border:1px solid #d9e6df;">Snappy / LZ4_RAW</td><td style="padding:8px;border:1px solid #d9e6df;">Decode throughput과 p95 latency 우선. 파일 증가로 I/O 병목이 생기는지 확인.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Remote I/O·storage 비쌈</td><td style="padding:8px;border:1px solid #d9e6df;">ZSTD 낮은~중간 level</td><td style="padding:8px;border:1px solid #d9e6df;">읽는 bytes 감소가 CPU 증가를 상쇄하는지 cost/query로 측정.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">장기 archive·write 드묾</td><td style="padding:8px;border:1px solid #d9e6df;">ZSTD / Gzip</td><td style="padding:8px;border:1px solid #d9e6df;">Reader 호환성과 복구 시간까지 포함. 최고 level 강제는 benchmark 후 결정.</td></tr>
+<tr><td style="padding:8px;border:1px solid #d9e6df;">Mixed reader fleet</td><td style="padding:8px;border:1px solid #d9e6df;">공통 지원 codec</td><td style="padding:8px;border:1px solid #d9e6df;">가장 오래된 production reader로 canary read. 지원표만 믿지 말고 실제 파일 검증.</td></tr>
+</table>
+<ul style="padding-left:22px;">
+<li><strong>Best practice:</strong> 동일 logical table·row-group/page 설정·warm-up·반복 횟수로 size, write MB/s, read MB/s, CPU time, peak RSS, query latency를 함께 기록한다.</li>
+<li><strong>Anti-pattern:</strong> 파일 크기 하나만 보고 codec을 전사 기본값으로 고정한다.</li>
+<li><strong>Edge case:</strong> 이미 암호화되거나 random에 가까운 payload는 압축이 거의 안 된다. ORC처럼 압축 결과가 더 크면 original chunk를 저장하는 포맷 동작도 있다.</li>
+<li><strong>Version/engine 차이:</strong> Parquet의 deprecated LZ4와 LZ4_RAW는 구분한다. ZSTD·LZ4_RAW 도입 시 reader 구현·버전별 read/write 지원을 확인한다.</li>
+<li><strong>Small-file 대응:</strong> Codec을 바꿔도 object listing·open·footer request 오버헤드는 줄지 않는다. Compaction과 적절한 row-group 크기가 별도 필요하다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">6. 장애 대응 표</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:15px;">
+<tr><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;width:30%;">순서</th><th style="padding:9px;border:1px solid #d9e6df;background:#173c32;color:#fff;">새 codec 배포 후 일부 reader 실패·latency 급증</th></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>① 증상</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Unsupported codec, decompression error, size mismatch, scan CPU·p99 latency·OOM 증가.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>② 먼저 수집할 증거/지표</strong></td><td style="padding:9px;border:1px solid #d9e6df;">문제 파일의 footer codec enum, writer/reader 버전, page 압축 전후 크기, 오류 offset, CPU profile, bytes read, peak memory, 실패 reader 목록.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>③ 가능한 가설</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Reader 미지원, LZ4 framing 혼동, truncated page/footer, 잘못된 uncompressed size, level 과다로 write backlog, 너무 큰 page의 buffer pressure.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>④ 안전한 첫 조치</strong></td><td style="padding:9px;border:1px solid #d9e6df;">문제 snapshot을 고정하고 작은 canary 파일을 알려진 공통 codec으로 별도 경로에 재작성해 oldest reader와 checksum을 검증한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>⑤ rollback/복구</strong></td><td style="padding:9px;border:1px solid #d9e6df;">Catalog pointer를 이전 snapshot으로 되돌리고, 새 codec 파일은 quarantine한다. 검증된 재작성본이 완성된 뒤 원자적으로 pointer를 전환한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d9e6df;"><strong>⑥ 하지 말아야 할 조치</strong></td><td style="padding:9px;border:1px solid #d9e6df;">원본을 in-place 수정, 실패 파일을 재시도만 반복, footer enum을 bytes 확인 없이 변경, 전체 dataset을 검증 없이 일괄 재압축하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">7. 35분 실습: 동일 Parquet를 codec별로 측정</h2>
+<p><strong>사전 조건:</strong> 저장소 root에서 Docker와 기존 lab image(<code>make build</code>)를 사용할 수 있어야 한다. PyArrow 20.0.0이 고정되어 있다.</p>
+<p><strong>먼저 예측:</strong> (1) 모든 파일의 row count와 checksum은 같다. (2) codec별 size·write/read 시간이 다르다. (3) 압축률 1등이 read latency 1등이라고 보장할 수 없다. (4) 파일 truncation은 footer 또는 page read에서 안전하게 실패해야 한다.</p>
+<div style="background:#14231e;color:#e8fff5;padding:14px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;">docker compose run --rm lab python - &lt;&lt;'PY'
+import os, shutil, tempfile, time
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+root = tempfile.mkdtemp(prefix="codec-lab-")
+try:
+    n = 200_000
+    table = pa.table({
+        "id": pa.array(range(n), type=pa.int64()),
+        "country": pa.array([("KR", "US", "JP", "DE")[i % 4] for i in range(n)]),
+        "payload": pa.array([f"group-{i % 100:03d}-" + "x" * 24 for i in range(n)]),
+    })
+    expected = pc.sum(table["id"]).as_py()
+    results = []
+    for codec in ("snappy", "zstd", "gzip", "lz4"):
+        if not pa.Codec.is_available(codec):
+            print(codec, "SKIP: unavailable")
+            continue
+        path = os.path.join(root, f"{codec}.parquet")
+        t0 = time.perf_counter()
+        pq.write_table(table, path, compression=codec, row_group_size=50_000)
+        write_s = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        out = pq.read_table(path, columns=["id"])
+        read_s = time.perf_counter() - t0
+        assert out.num_rows == n and pc.sum(out["id"]).as_py() == expected
+        meta = pq.ParquetFile(path).metadata.row_group(0).column(0)
+        results.append((codec, os.path.getsize(path), write_s, read_s, meta.compression))
+    for row in sorted(results, key=lambda x: x[1]):
+        print("codec=%s bytes=%d write=%.4fs read=%.4fs metadata=%s" % row)
+
+    source = os.path.join(root, "snappy.parquet")
+    broken = os.path.join(root, "truncated.parquet")
+    with open(source, "rb") as src, open(broken, "wb") as dst:
+        data = src.read()
+        dst.write(data[:-32])
+    try:
+        pq.read_table(broken)
+        raise AssertionError("truncated file unexpectedly readable")
+    except Exception as exc:
+        print("SAFE_FAILURE:", type(exc).__name__)
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+PY</div>
+<p><strong>예상 관찰:</strong> 실행 환경에 따라 순위와 시간은 달라지지만 네 파일의 logical checksum은 같다. Metadata에는 실제 codec이 기록되고, truncation은 정상 결과를 내지 않는다. 한 번의 wall-clock 결과를 결론으로 삼지 말고 5회 이상 반복·warm-up하고 median과 p95를 기록한다.</p>
+<p><strong>실패 주입:</strong> Snappy 파일의 마지막 32 bytes를 잘라 footer를 손상시킨다. Reader가 실패하지 않으면 테스트 실패다.</p>
+<p><strong>자주 나는 오류와 해결:</strong> LZ4가 unavailable이면 SKIP 결과를 기록하고 engine 지원을 확인한다. Docker image가 없으면 먼저 <code>make build</code>한다. Host background load가 크면 CPU pinning 또는 반복 횟수를 늘린다.</p>
+<p><strong>Cleanup:</strong> <code>finally</code>가 임시 directory를 제거하고 <code>--rm</code>이 container를 제거한다. 실행 중 강제 종료했다면 <code>/tmp/codec-lab-*</code> 중 본 실습이 만든 경로만 확인 후 삭제한다.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px;">
+<li>Encoding과 compression을 섞어 말하지 않는다. Dictionary/RLE 뒤에 Snappy/ZSTD가 적용된다.</li>
+<li>Compression ratio만 보고 고르지 않는다. Scan CPU, bytes read, memory, tail latency, reader 지원을 함께 본다.</li>
+<li>Parquet <code>LZ4</code>와 <code>LZ4_RAW</code>를 같은 framing으로 간주하지 않는다.</li>
+<li>Codec level과 library version을 benchmark report에 기록하지 않으면 결과를 재현할 수 없다.</li>
+<li>OS page cache·object cache·warm-up 상태가 다른 실험을 비교하지 않는다.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<p><strong>Q1. 100TB read-heavy lake에서 Snappy와 ZSTD 중 선택하라.</strong><br><strong>좋은 답변 구조:</strong> query projection·scan bytes·CPU quota·network 가격 가정 → 같은 encoding/page/row group으로 A/B → size, decompression GB/s, p95 query, cost/query → oldest reader 호환성 → canary와 rollback.</p>
+<p><strong>Q2. ZSTD로 바꿨더니 파일은 25% 줄고 query는 15% 느려졌다. 유지할 것인가?</strong><br><strong>좋은 답변 구조:</strong> workload SLO와 비용 목표 확인 → CPU-bound/I/O-bound 분리 → concurrency와 cache hit까지 계산 → level 조정·column별 codec·Snappy 대안 → 대표 workload 수치로 결정.</p>
+<p><strong>Q3. 새 LZ4 파일을 일부 engine이 못 읽는다. 원인을 byte path로 설명하라.</strong><br><strong>좋은 답변 구조:</strong> footer codec enum → LZ4 vs LZ4_RAW framing → range read와 page header sizes → decompressor 지원 → 실패 window → quarantine·공통 codec 재작성·snapshot rollback.</p>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">10. 복습 문제와 정답</h2>
+<h3 style="font-size:18px;color:#245b4a;">어제 내용 회상 3문제</h3>
+<ol style="padding-left:22px;"><li>Dictionary가 low-cardinality에서 유리한 이유는?</li><li>RLE와 bit packing이 각각 유리한 분포는?</li><li>Delta encoding이 정렬이 깨지면 불리해지는 이유는?</li></ol>
+<h3 style="font-size:18px;color:#245b4a;">오늘 내용 확인 3문제</h3>
+<ol style="padding-left:22px;"><li>Compression ratio만으로 codec을 고르면 안 되는 이유를 두 가지 말하라.</li><li>Parquet의 LZ4와 LZ4_RAW를 구분해야 하는 이유는?</li><li>Reader가 compressed page를 logical values로 만드는 순서를 쓰라.</li></ol>
+<div style="padding:15px;background:#eef4ff;border:1px solid #b7caeb;"><strong>짧은 정답·채점 기준</strong><br>어제 1: 고유값을 한 번 저장하고 작은 ID를 반복. 2: 긴 동일 run은 RLE, 작은 범위의 섞인 정수는 packing. 3: 인접 delta가 커져 bit width 증가.<br>오늘 1: CPU/latency·memory·호환성·I/O가 함께 변함 중 두 가지. 2: 과거 LZ4 enum의 비표준 framing이 deprecated이고 LZ4_RAW가 상호운용 규격이기 때문. 3: range read → decompress → decode → vector/materialize.<br><strong>채점:</strong> 각 2점, 총 12점 중 9점 이상 통과. 정의 1점 + 내부 흐름·trade-off 1점.</div>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">11. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://github.com/apache/parquet-format/blob/master/Compression.md" style="color:#0c7653;">Apache Parquet Compression Definitions</a> — codec framing과 LZ4/LZ4_RAW 경계.</li>
+<li><a href="https://parquet.apache.org/docs/file-format/versions/" style="color:#0c7653;">Apache Parquet Format Versions</a> — codec 도입과 forward compatibility.</li>
+<li><a href="https://parquet.apache.org/docs/file-format/implementationstatus/" style="color:#0c7653;">Apache Parquet Implementation Status</a> — engine별 codec read/write 지원.</li>
+<li><a href="https://orc.apache.org/specification/ORCv1/" style="color:#0c7653;">Apache ORC Specification v1</a> — compression chunk, header, original-block 처리.</li>
+</ul>
+
+<h2 style="font-size:22px;color:#173c32;border-bottom:2px solid #dcebe4;padding-bottom:8px;margin:28px 0 14px;">12. 내일 예고</h2>
+<div style="padding:16px;background:#173c32;color:#ffffff;"><strong>Day 31 · cardinality와 sortedness 효과</strong><br>같은 codec이라도 값 종류 수와 정렬 순서가 dictionary·RLE·delta, page statistics, compression ratio를 어떻게 바꾸는지 측정한다.</div>
+</td></tr></table></td></tr></table>
+</body>
+</html>

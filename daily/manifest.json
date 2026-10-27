@@ -4,7 +4,7 @@
   "tagline": "byte layout에서 query engine·production contract까지",
   "accent": "#34d399",
   "totalDays": 63,
-  "updatedAt": "2026-10-14T09:01:29+09:00",
+  "updatedAt": "2026-10-17T09:02:02+09:00",
   "lessons": [
     {
       "day": 1,
@@ -266,6 +266,15 @@
       "path": "day-29.html",
       "kind": "lesson",
       "publishedAt": "2026-10-14T09:01:29+09:00"
+    },
+    {
+      "day": 30,
+      "week": 5,
+      "title": "Snappy, ZSTD, Gzip, LZ4 특성",
+      "summary": "Snappy·ZSTD·Gzip·LZ4의 framing·압축률·throughput·CPU·I/O·memory·reader 호환성을 end-to-end query cost로 비교합니다.",
+      "path": "day-30.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-17T09:02:02+09:00"
     }
   ]
 }
